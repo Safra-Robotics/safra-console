@@ -1,23 +1,31 @@
 """Local persistence for the operator console: operators, robots, event log.
 
-Everything lives in code/console/data/ (gitignored — per-machine state).
-Operator PINs are PBKDF2-hashed, but this is an OPERATOR IDENTITY layer for
-session logs and the demo's identity beat — the console binds to 127.0.0.1
-and is not a network security boundary.
+Per-machine state (gitignored in a source checkout). Operator PINs are
+PBKDF2-hashed, but this is an OPERATOR IDENTITY layer for session logs — the
+console binds to 127.0.0.1 and is not a network security boundary.
 """
 
 import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 
-# packaged installs point this at %LOCALAPPDATA%\SafraConsole\data via the
-# launcher (the install dir shouldn't hold mutable state); dev checkouts
-# default next to the code
-DATA_DIR = os.environ.get("SAFRA_CONSOLE_DATA") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data")
+
+def _default_data_dir():
+    # explicit override wins; an installed (frozen) build keeps mutable state
+    # out of the install dir, under %LOCALAPPDATA%; a source checkout uses ./data
+    if os.environ.get("SAFRA_CONSOLE_DATA"):
+        return os.environ["SAFRA_CONSOLE_DATA"]
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "SafraConsole", "data")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+DATA_DIR = _default_data_dir()
 OPS_FILE = os.path.join(DATA_DIR, "operators.json")
 BINDINGS_FILE = os.path.join(DATA_DIR, "bindings.json")
 ROBOTS_FILE = os.path.join(DATA_DIR, "robots.json")

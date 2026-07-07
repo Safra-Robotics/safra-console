@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,11 +22,13 @@ import updater
 import version
 from links import SimLink, TcpLink
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-UI_DIR = os.path.join(HERE, "ui")
-# dev checkout serves the repo's canonical assets; packaged installs carry a
-# copy under ui/brand (build_release.py puts it there)
-BRAND_DIR = os.path.normpath(os.path.join(HERE, "..", "..", "assets"))
+# PyInstaller unpacks bundled data (ui/) under sys._MEIPASS; a source checkout
+# serves it from next to this file.
+RES = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+UI_DIR = os.path.join(RES, "ui")
+# a source checkout serves the monorepo's canonical assets; a packaged build
+# carries a copy under ui/brand
+BRAND_DIR = os.path.normpath(os.path.join(RES, "..", "..", "assets"))
 if not os.path.isdir(BRAND_DIR):
     BRAND_DIR = os.path.join(UI_DIR, "brand")
 
@@ -269,15 +272,6 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/update/check":
             if self._auth():
                 self._json(updater.check())
-
-        elif u.path == "/api/update/apply":
-            op = self._auth()
-            if op:
-                res = updater.apply()
-                if res.get("staged"):
-                    APP.log.add("app", "update v{} staged — restart the console to apply".format(
-                        res.get("version")), operator=op["name"])
-                self._json(res, 200 if res.get("ok") else 400)
 
         elif u.path == "/api/disconnect":
             op = self._auth()

@@ -1,10 +1,11 @@
 """Single version source for the Safra Operator Console.
 
-Bumped by hand per release; tools/build_release.py stamps it into the
-package manifest and the updater compares against the feed's latest.json.
+Bumped by hand per release; tools/build_installer.py stamps it into the
+installer + update manifest, and the updater compares against the feed's
+latest.json.
 """
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def parse(v):

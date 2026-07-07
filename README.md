@@ -12,10 +12,12 @@ can try the whole interface immediately.
 
 ## Download
 
-Grab the latest packaged Windows build from the
-[**Releases**](https://github.com/Safra-Robotics/safra-operator-console/releases/latest)
-page — unzip anywhere and run `SafraConsole.bat`. No install, no Python
-required; the app checks for updates on its own and installs them in place.
+Get the Windows installer — **[safrarobotics.com/console](https://safrarobotics.com/console)**
+(or the [Releases](https://github.com/Safra-Robotics/safra-console/releases/latest)
+page) — and run **`SafraConsole-Setup.exe`**. It installs per-user (no admin,
+no Python), adds a Start-Menu shortcut, and appears in *Apps & features*.
+The app checks for updates on launch and points you to the new installer,
+which updates it in place.
 
 ## Run from source
 
@@ -77,15 +79,19 @@ libraries: floor grid, walls, racking with cases, a pallet drop zone, and
 the robot's own fork blades rising through the frame as you lift. Field
 robots show a placeholder until live video ships.
 
-## Packaging & auto-update
+## Building the installer & auto-update
 
-`python tools/build_release.py` produces a portable Windows build (an
-embeddable CPython runtime + the app + a launcher) plus a `latest.json`
-update manifest, and prints the `gh release create` command to publish
-them. Packaged installs check the release feed at startup, offer an
-in-app **Install** for a newer version (download → SHA-256 verify → stage),
-and the launcher swaps the new version in on next start. Running from a
-source checkout never self-updates.
+`python tools/build_installer.py` bundles the app into a standalone
+`SafraConsole.exe` with [PyInstaller](https://pyinstaller.org), packs it
+into `SafraConsole-Setup.exe` with [Inno Setup](https://jrsoftware.org/isinfo.php)
+(per-user, Start-Menu shortcut, uninstaller), and writes the `latest.json`
+update manifest. It prints the `gh release create` command to publish both
+as GitHub release assets. Requires `pyinstaller` (pip) and Inno Setup 6.
+
+Installed builds check the release feed on launch; when a newer version is
+published, a banner links to the new installer. Running it updates in place
+— Inno Setup's Restart Manager closes and relaunches the app. Running from
+a source checkout never self-updates (git is its channel).
 
 ## Architecture
 
@@ -95,7 +101,7 @@ ui/  (HTML / CSS / JS, Safra brand)
 server.py  (Python standard-library http.server)
   ├─ SimLink → sim.py            the built-in test robot
   ├─ TcpLink → host:port         protocol v1 over TCP → robot UART
-  └─ updater.py → release feed   (packaged installs only)
+  └─ updater.py → release feed   (installed builds only)
 ```
 
 Drive and jog intents are re-streamed at 15 Hz and dead-man to zero on

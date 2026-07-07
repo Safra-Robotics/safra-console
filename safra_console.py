@@ -25,6 +25,15 @@ import server  # noqa: E402
 DEFAULT_PORT = 8973
 
 
+def _log(msg):
+    # a --windowed (no-console) build has sys.stdout = None; don't crash on it
+    try:
+        if sys.stdout:
+            print(msg)
+    except Exception:
+        pass
+
+
 def find_edge():
     candidates = [
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
@@ -72,9 +81,14 @@ def main():
                     help="run the backend without opening a window")
     args = ap.parse_args()
 
-    httpd = server.serve(args.port)
-    url = "http://127.0.0.1:{}/".format(args.port)
-    print("Safra Operator Console at {}".format(url))
+    try:
+        httpd = server.serve(args.port)
+    except OSError:
+        # port busy (e.g. a second launch) — take any free port
+        httpd = server.serve(0)
+    port = httpd.server_address[1]
+    url = "http://127.0.0.1:{}/".format(port)
+    _log("Safra Operator Console at {}".format(url))
 
     if args.serve_only:
         try:
@@ -88,7 +102,7 @@ def main():
     mode, _ = open_window(url)
     if mode == "browser":
         # nothing to wait on — keep serving until Ctrl+C
-        print("opened in the default browser; Ctrl+C to quit")
+        _log("opened in the default browser; Ctrl+C to quit")
         try:
             threading.Event().wait()
         except KeyboardInterrupt:

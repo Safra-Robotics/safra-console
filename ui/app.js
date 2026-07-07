@@ -600,34 +600,23 @@ $("bind-reset").addEventListener("click", () => {
   renderBindTable();
 });
 
-/* ---------- updates ---------- */
+/* ---------- updates ----------
+   Installed builds check the release feed; if a newer version is published,
+   the banner links to the new installer. Running it updates in place. */
+let updateUrl = null;
 async function refreshUpdateStatus(retried) {
   let s;
   try { s = await api("/api/update/status"); } catch { return; }
   if (!s.checked && !retried) { setTimeout(() => refreshUpdateStatus(true), 6000); return; }
-  if (s.available) {
+  if (s.available && s.available.url) {
+    updateUrl = s.available.url;
+    $("update-text").textContent = `Version ${s.available.version} is available.`;
+    $("update-apply").textContent = "Download update";
     $("update-banner").hidden = false;
-    if (s.staged) {
-      $("update-text").textContent = `Update v${s.available.version} staged — close and reopen the console to finish.`;
-      $("update-apply").hidden = true;
-    } else {
-      $("update-text").textContent = `Update v${s.available.version} available`;
-      $("update-apply").hidden = false;
-    }
   }
 }
-$("update-apply").addEventListener("click", async () => {
-  $("update-apply").disabled = true;
-  $("update-apply").textContent = "Installing…";
-  try {
-    const r = await api("/api/update/apply", {});
-    $("update-text").textContent = `Update v${r.version} staged — close and reopen the console to finish.`;
-    $("update-apply").hidden = true;
-  } catch (err) {
-    $("update-text").textContent = "Update failed: " + err.message;
-  }
-  $("update-apply").disabled = false;
-  $("update-apply").textContent = "Install";
+$("update-apply").addEventListener("click", () => {
+  if (updateUrl) window.open(updateUrl, "_blank", "noopener");
 });
 
 /* ---------- sim feed: simple first-person 3D from the mast camera ----------
