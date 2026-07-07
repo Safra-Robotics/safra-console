@@ -13,7 +13,7 @@ can try the whole interface immediately.
 ## Download
 
 Grab the latest packaged Windows build from the
-[**Releases**](https://github.com/SuleimanGrape/safra-operator-console/releases/latest)
+[**Releases**](https://github.com/Safra-Robotics/safra-operator-console/releases/latest)
 page — unzip anywhere and run `SafraConsole.bat`. No install, no Python
 required; the app checks for updates on its own and installs them in place.
 

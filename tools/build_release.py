@@ -41,7 +41,7 @@ PY_EMBED_URL = "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd
 # brand assets (ui/brand/) ride along in the ui/ copytree below
 APP_FILES = ["safra_console.py", "server.py", "sim.py", "links.py",
              "stores.py", "updater.py", "version.py", "protocol.md", "README.md"]
-DEFAULT_BASE_URL = ("https://github.com/SuleimanGrape/safra-operator-console"
+DEFAULT_BASE_URL = ("https://github.com/Safra-Robotics/safra-operator-console"
                     "/releases/latest/download")
 
 LAUNCHER = r"""@echo off

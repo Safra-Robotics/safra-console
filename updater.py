@@ -33,7 +33,7 @@ import zipfile
 import version
 from stores import DATA_DIR
 
-DEFAULT_FEED = ("https://github.com/SuleimanGrape/safra-operator-console"
+DEFAULT_FEED = ("https://github.com/Safra-Robotics/safra-operator-console"
                 "/releases/latest/download/latest.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "update.json")
 
