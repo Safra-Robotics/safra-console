@@ -99,8 +99,10 @@ def build(base_url, notes):
     with open(os.path.join(root, "SafraConsole.bat"), "w", encoding="ascii") as f:
         f.write(LAUNCHER)
 
-    # zip it
-    zip_name = "SafraConsole-v{}-win64.zip".format(VERSION)
+    # zip it — version-LESS filename on purpose: the release tag carries the
+    # version, and a stable asset name gives a permanent "download latest"
+    # URL (releases/latest/download/<name>) for the website + the update feed.
+    zip_name = "SafraConsole-win64.zip"
     zip_path = os.path.join(DIST, zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for dirpath, _dirs, files in os.walk(root):
