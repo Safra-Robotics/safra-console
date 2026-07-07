@@ -1,0 +1,14 @@
+# per-machine state (operators, robots, control bindings, session log)
+data/
+
+# release build outputs + embeddable-python cache
+dist/
+tools/_cache/
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
+Thumbs.db

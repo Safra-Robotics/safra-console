@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 300" width="1440" height="300">
+<rect width="1440" height="300" fill="#0e0e0e"></rect>
+<circle cx="230.4" cy="54.0" r="1" fill="#fff" opacity="0.4"></circle>
+<circle cx="403.2" cy="84.0" r="1" fill="#FFD400" opacity="0.45"></circle>
+<circle cx="576.0" cy="48.0" r="1" fill="#fff" opacity="0.3"></circle>
+<circle cx="748.8" cy="72.0" r="1" fill="#fff" opacity="0.4"></circle>
+<circle cx="921.6" cy="66.0" r="1" fill="#fff" opacity="0.4"></circle>
+<circle cx="1094.4" cy="90.0" r="1" fill="#FFD400" opacity="0.45"></circle>
+<circle cx="1267.2" cy="60.0" r="1" fill="#fff" opacity="0.35"></circle>
+<g transform="translate(1180.8 42.0) scale(0.708)" opacity="0.9"><path d="M12 1 L13.4 9 L21 12 L13.4 15 L12 23 L10.6 15 L3 12 L10.6 9 Z" fill="#FFD400"></path></g>
+<g transform="translate(288.0 90.0) scale(0.500)" opacity="0.5"><path d="M12 1 L13.4 9 L21 12 L13.4 15 L12 23 L10.6 15 L3 12 L10.6 9 Z" fill="#fff"></path></g>
+
+<path d="M -120 300 C 150 300, 240 142, 420 142 C 600 142, 720 300, 900 300 Z" fill="#E6B23A"></path>
+<path d="M 560 300 C 760 300, 840 188, 1000 188 C 1160 188, 1290 300, 1500 300 Z" fill="#CC9415"></path>
+<path d="M -40 300 C 110 300, 150 224, 270 224 C 390 224, 470 300, 640 300 Z" fill="#FFD51E"></path>
+<path d="M -180 300 C -40 300, 10 242, 110 242 C 210 242, 280 300, 400 300 Z" fill="#F2C73E"></path>
+<path d="M 1080 300 C 1220 300, 1300 236, 1400 236 C 1500 236, 1560 300, 1660 300 Z" fill="#FFE268"></path>
+</svg>
