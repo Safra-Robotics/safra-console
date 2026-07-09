@@ -2,16 +2,20 @@
 
 Three steps:
   1. PyInstaller bundles the app into a standalone folder — a real
-     SafraConsole.exe plus _internal/ (Python runtime + the ui/ tree), no
-     Python install needed on the target machine.
+     SafraConsole.exe plus _internal/ (Python runtime, the ui/ tree, and
+     pywebview so the app renders in an embedded WebView2 window), no Python
+     install needed on the target machine.
   2. Inno Setup (ISCC) packs that into a per-user installer,
      dist/SafraConsole-Setup.exe: installs per-user under LocalAppData
      (no admin), Start-Menu shortcut, uninstaller, and — on an update — the
-     Restart Manager closes and relaunches the running app.
+     Restart Manager closes and relaunches the running app. It also chains the
+     WebView2 Evergreen bootstrapper, run only when the runtime is missing, so
+     the app works out of the box without depending on the user's browser.
   3. Writes dist/latest.json (the update feed: version, the installer's
      download URL, its sha256).
 
-Requires pyinstaller (pip) and Inno Setup 6 (ISCC.exe).
+Requires pyinstaller + pywebview (pip) and Inno Setup 6 (ISCC.exe). Downloads
+the WebView2 bootstrapper on first run (cached in build/).
 Usage:  python tools/build_installer.py [--base-url URL] [--iscc PATH]
 """
 
@@ -33,6 +37,11 @@ sys.path.insert(0, REPO)
 from version import VERSION  # noqa: E402
 
 SETUP_NAME = "SafraConsole-Setup.exe"
+# The Evergreen bootstrapper (~2 MB). The installer runs it only when the target
+# machine lacks the WebView2 runtime; it then downloads + installs the runtime,
+# which Microsoft keeps security-patched. Cached in build/ across builds.
+WV2_BOOTSTRAP_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+WV2_BOOTSTRAP = os.path.join(BUILD, "MicrosoftEdgeWebview2Setup.exe")
 DEFAULT_BASE_URL = ("https://github.com/Safra-Robotics/safra-console"
                     "/releases/latest/download")
 DEFAULT_ISCC = os.path.join(os.environ.get("LOCALAPPDATA", ""),
@@ -65,6 +74,9 @@ RestartApplications=yes
 
 [Files]
 Source: "@SRCDIR@\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; WebView2 Evergreen bootstrapper — extracted to {tmp} and run by InstallWebView2
+; (below) only when the runtime is missing, then deleted.
+Source: "@WV2SETUP@"; DestDir: "{tmp}"; Flags: deleteafterinstall; AfterInstall: InstallWebView2
 
 [Icons]
 Name: "{group}\Safra Operator Console"; Filename: "{app}\SafraConsole.exe"
@@ -75,6 +87,34 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\SafraConsole.exe"; Description: "Launch Safra Operator Console"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Detect the WebView2 Evergreen runtime (per-machine or per-user). The runtime
+// is registered by EdgeUpdate (a 32-bit app), so a 64-bit OS stores it under
+// WOW6432Node. A valid install has a non-empty 'pv' other than 0.0.0.0.
+function WebView2RuntimeInstalled(): Boolean;
+var
+  pv: String;
+begin
+  Result := False;
+  if RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv) then
+    Result := (pv <> '') and (pv <> '0.0.0.0');
+  if (not Result) and RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv) then
+    Result := (pv <> '') and (pv <> '0.0.0.0');
+  if (not Result) and RegQueryStringValue(HKCU, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', pv) then
+    Result := (pv <> '') and (pv <> '0.0.0.0');
+end;
+
+// Runs after the bootstrapper is copied to {tmp}. Installs the runtime silently
+// only when it is absent; a failure here is non-fatal (the app still ships a
+// browser fallback), so we don't abort the install.
+procedure InstallWebView2();
+var
+  ResultCode: Integer;
+begin
+  if not WebView2RuntimeInstalled() then
+    Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe'), '/silent /install', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
+end;
 """
 
 
@@ -90,7 +130,10 @@ def build_exe():
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
          "--windowed", "--name", "SafraConsole", "--icon", ICON,
          "--add-data", os.path.join(REPO, "ui") + ";ui",
-         "--exclude-module", "webview",
+         # bundle pywebview so the app renders in an embedded WebView2 window
+         # (no dependency on the user's Edge/default browser); the hook pulls in
+         # pythonnet + the WebView2 interop DLLs
+         "--collect-all", "webview",
          "--distpath", os.path.join(BUILD, "pyi"),
          "--workpath", os.path.join(BUILD, "work"),
          "--specpath", BUILD,
@@ -101,10 +144,24 @@ def build_exe():
     return src
 
 
+def fetch_webview2_bootstrapper():
+    """Download the Evergreen bootstrapper into build/ (cached across builds)."""
+    if os.path.isfile(WV2_BOOTSTRAP) and os.path.getsize(WV2_BOOTSTRAP) > 100_000:
+        return
+    print("+ downloading WebView2 Evergreen bootstrapper")
+    os.makedirs(BUILD, exist_ok=True)
+    import urllib.request
+    urllib.request.urlretrieve(WV2_BOOTSTRAP_URL, WV2_BOOTSTRAP)
+    if os.path.getsize(WV2_BOOTSTRAP) < 100_000:
+        raise SystemExit("WebView2 bootstrapper download looks wrong (too small)")
+
+
 def build_installer(srcdir, iscc):
     os.makedirs(DIST, exist_ok=True)
+    fetch_webview2_bootstrapper()
     iss = (ISS.replace("@VERSION@", VERSION).replace("@OUTDIR@", DIST)
-              .replace("@ICON@", ICON).replace("@SRCDIR@", srcdir))
+              .replace("@ICON@", ICON).replace("@SRCDIR@", srcdir)
+              .replace("@WV2SETUP@", WV2_BOOTSTRAP))
     iss_path = os.path.join(BUILD, "SafraConsole.iss")
     with open(iss_path, "w", encoding="utf-8") as f:
         f.write(iss)

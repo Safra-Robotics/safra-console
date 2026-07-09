@@ -56,19 +56,26 @@ def find_edge():
 def open_window(url):
     """Open the app window; return the mode used.
 
-    Only pywebview blocks until the window closes. The Edge/browser launchers
-    return almost immediately (Edge --app hands the window to a background
-    process and the launcher exits at once) — their process lifetime is NOT the
-    window's, so those paths return here right away and the caller waits on the
-    front-end liveness stream instead (server.wait_until_idle)."""
+    Preference order: a real embedded WebView2 window (pywebview) → Edge in
+    --app mode → the default browser. Only pywebview blocks until the window
+    closes; the Edge/browser launchers return almost immediately (their process
+    is not the window's lifetime — the caller waits on the liveness stream, see
+    server.wait_until_idle). Any failure to bring up the embedded webview (not
+    bundled, or no WebView2 runtime on the machine) falls through to the browser
+    paths, so the app always opens something."""
     try:
         import webview  # type: ignore
-        webview.create_window("Safra Operator Console", url,
-                              width=1280, height=800, background_color="#0E0E0E")
-        webview.start()
-        return "pywebview"
     except ImportError:
-        pass
+        webview = None
+    if webview is not None:
+        try:
+            webview.create_window("Safra Operator Console", url,
+                                  width=1280, height=800, background_color="#0E0E0E")
+            _log("opening embedded WebView2 window")
+            webview.start()
+            return "pywebview"
+        except Exception as e:  # no WebView2 runtime, backend init failure, etc.
+            _log("embedded webview unavailable ({!r}); falling back to browser".format(e))
     edge = find_edge()
     if edge:
         profile = os.path.join(os.environ.get("LOCALAPPDATA", "."),
