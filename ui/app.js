@@ -799,6 +799,10 @@ function drawScene(t) {
 }
 
 /* ---------- boot ---------- */
+// Liveness: hold a stream open so the desktop shell knows this window is up.
+// When the window closes the socket drops and the local server exits; kept on
+// `state` so it isn't garbage-collected. Harmless in a plain browser tab.
+try { state.alive = new EventSource("/api/alive"); } catch (e) { /* no SSE */ }
 renderKeysHint();
 initLogin().catch((e) => {
   document.title = "SafraConsole boot error: " + e.message;

@@ -5,7 +5,7 @@ installer + update manifest, and the updater compares against the feed's
 latest.json.
 """
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 def parse(v):

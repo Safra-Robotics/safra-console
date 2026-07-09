@@ -43,6 +43,7 @@ class App:
         self.link = None
         self.robot = None
         self.log = stores.EventLog()
+        self.alive = 0            # open /api/alive streams (desktop-window heartbeat)
 
     def operator(self, token):
         return self.sessions.get(token or "")
@@ -169,11 +170,41 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return
 
+    # --- liveness heartbeat -----------------------------------------------------
+
+    def _alive(self):
+        """Open-ended stream the desktop window holds while it's up.
+
+        The shell can't track the window via the browser launcher process (Edge
+        --app hands the window to a background process and the launcher exits at
+        once), so the front-end keeps this stream open instead. When the window
+        closes the socket drops, APP.alive falls to 0, and wait_until_idle()
+        lets the process exit. No auth: it carries no data, only liveness.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        with APP.lock:
+            APP.alive += 1
+        try:
+            while True:
+                self.wfile.write(b": alive\n\n")  # SSE comment; ignored by the client
+                self.wfile.flush()
+                time.sleep(1.0)
+        except OSError:
+            return
+        finally:
+            with APP.lock:
+                APP.alive -= 1
+
     # --- routes ---------------------------------------------------------------------
 
     def do_GET(self):
         u = urlparse(self.path)
-        if u.path == "/api/stream":
+        if u.path == "/api/alive":
+            self._alive()
+        elif u.path == "/api/stream":
             self._stream(parse_qs(u.query))
         elif u.path == "/api/bootstrap":
             ops = stores.list_operators()
@@ -305,7 +336,43 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True  # don't let in-flight requests block process exit
+
+    def handle_error(self, request, client_address):
+        # A client vanishing mid-request (window closed, tab reloaded) aborts the
+        # socket — that's expected here, not an error worth logging. It matters
+        # doubly in the --windowed build, where sys.stderr is None and the
+        # default traceback dump would blow up. Real errors still propagate.
+        if not issubclass(sys.exc_info()[0] or Exception, (ConnectionError, BrokenPipeError)):
+            super().handle_error(request, client_address)
+
+
 def serve(port):
     updater.check_async()  # non-blocking; result lands in /api/update/status
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = _Server(("127.0.0.1", port), Handler)
     return httpd
+
+
+def wait_until_idle(grace=3.0, startup=30.0):
+    """Block until the desktop window is gone.
+
+    Returns once the front-end's /api/alive stream has connected and then stayed
+    gone for `grace` seconds (window closed), or if no window ever connects
+    within `startup` seconds (nothing to wait on). This is how the shell tracks
+    the window's lifetime when the browser launcher process can't — see _alive.
+    """
+    start = time.monotonic()
+    seen = False
+    gone_at = None
+    while True:
+        time.sleep(0.5)
+        if APP.alive > 0:
+            seen, gone_at = True, None
+        elif not seen:
+            if time.monotonic() - start > startup:
+                return
+        elif gone_at is None:
+            gone_at = time.monotonic()
+        elif time.monotonic() - gone_at > grace:
+            return

@@ -54,24 +54,30 @@ def find_edge():
 
 
 def open_window(url):
+    """Open the app window; return the mode used.
+
+    Only pywebview blocks until the window closes. The Edge/browser launchers
+    return almost immediately (Edge --app hands the window to a background
+    process and the launcher exits at once) — their process lifetime is NOT the
+    window's, so those paths return here right away and the caller waits on the
+    front-end liveness stream instead (server.wait_until_idle)."""
     try:
         import webview  # type: ignore
-        w = webview.create_window("Safra Operator Console", url,
-                                  width=1280, height=800, background_color="#0E0E0E")
+        webview.create_window("Safra Operator Console", url,
+                              width=1280, height=800, background_color="#0E0E0E")
         webview.start()
-        return "pywebview", w
+        return "pywebview"
     except ImportError:
         pass
     edge = find_edge()
     if edge:
         profile = os.path.join(os.environ.get("LOCALAPPDATA", "."),
                                "SafraConsole", "edge-profile")
-        proc = subprocess.Popen([edge, "--app=" + url, "--window-size=1280,800",
-                                 "--user-data-dir=" + profile])
-        proc.wait()
-        return "edge-app", None
+        subprocess.Popen([edge, "--app=" + url, "--window-size=1280,800",
+                          "--user-data-dir=" + profile])
+        return "edge-app"
     webbrowser.open(url)
-    return "browser", None
+    return "browser"
 
 
 def main():
@@ -99,12 +105,16 @@ def main():
 
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
-    mode, _ = open_window(url)
-    if mode == "browser":
-        # nothing to wait on — keep serving until Ctrl+C
-        _log("opened in the default browser; Ctrl+C to quit")
+    mode = open_window(url)
+    if mode != "pywebview":
+        # Edge --app / default browser: the launcher process already returned, so
+        # keep serving until the window's liveness stream drops (window closed).
+        # Without this the process would exit at once and the window — opening a
+        # beat later — would hit a dead server and show a blank screen.
+        if mode == "browser":
+            _log("opened in the default browser; close the tab or Ctrl+C to quit")
         try:
-            threading.Event().wait()
+            server.wait_until_idle()
         except KeyboardInterrupt:
             pass
     httpd.shutdown()
