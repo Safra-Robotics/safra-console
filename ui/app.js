@@ -212,6 +212,8 @@ async function connectRobot(rb) {
     $("hud-feed").textContent = rb.kind === "sim" ? "SIM FEED · CAM-1" : "FIELD LINK";
     $("no-video").hidden = rb.kind === "sim";
     $("sim-canvas").style.display = rb.kind === "sim" ? "block" : "none";
+    if (rb.kind === "sim") view.have = false;   // re-snap the eased view pose
+
     $("event-log").innerHTML = "";
     state.lastEvtId = 0;
     setView("console");
@@ -298,7 +300,7 @@ function renderTelem(d) {
   if (t.pose) {
     $("hud-pose").textContent =
       `X ${t.pose[0].toFixed(2)}m  Y ${t.pose[1].toFixed(2)}m  θ ${(t.pose[2] * 180 / Math.PI).toFixed(0)}°  V ${t.speed.toFixed(2)}m/s`;
-    drawScene(t);
+    feedSim(t);
   }
 }
 
@@ -619,14 +621,48 @@ $("update-apply").addEventListener("click", () => {
   if (updateUrl) window.open(updateUrl, "_blank", "noopener");
 });
 
-/* ---------- sim feed: simple first-person 3D from the mast camera ----------
-   Software pinhole projection on canvas 2D — no libraries. Camera rides the
-   mast top (robot-local x 0.25, z 1.05, pitched down 12°); world objects are
-   boxes rendered painter-sorted with near-plane clipping. */
+/* ---------- sim feed: first-person 3D from the mast camera ----------
+   Dependency-free software renderer on canvas 2D. A pinhole camera rides the
+   mast top (robot-local x 0.25, z 1.05, pitched down ~12°). World geometry is
+   axis-aligned boxes, each carrying an outward normal + a material; the
+   renderer near-clips, back-face culls, Lambert-shades against a key light,
+   applies distance fog, then painter-sorts far -> near. Long surfaces (walls,
+   floor bays) are baked into ~1 m tiles so average-depth sorting stays correct
+   as the operator turns — one un-tiled 12 m wall quad would otherwise pop in
+   front of the racks. Telemetry lands at 10 Hz; a requestAnimationFrame loop
+   eases the view pose between frames so the feed reads at display rate. */
 const canvas = $("sim-canvas");
 const ctx = canvas.getContext("2d");
 const WORLD = { w: 12, h: 8 };
 const CAM = { lx: 0.25, z: 1.05, pitch: 0.21, near: 0.06 };
+
+// one key light (above, front-left) + ambient; fog haze fills the deep aisles
+const LIGHT = (() => { const v = [-0.35, -0.30, 1.0], m = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / m, v[1] / m, v[2] / m]; })();
+const AMBIENT = 0.44, DIFFUSE = 0.56;
+const FOG = [11, 11, 15], FOG_NEAR = 4.5, FOG_FAR = 19, FOG_MAX = 0.9;
+
+// material = base rgb + alpha; `flat` skips shading & back-face culling (floor
+// decals, emissive ceiling strips); `edge` is an optional outline rgba.
+const MAT = {
+  wall:    { col: [30, 30, 35], a: 0.98, edge: [244, 243, 239, 0.05] },
+  upright: { col: [46, 43, 38], a: 0.96, edge: [255, 212, 0, 0.55] },
+  beam:    { col: [150, 108, 18], a: 0.97, edge: [255, 212, 0, 0.8] },
+  card:    { col: [124, 95, 56], a: 0.96, edge: [230, 178, 58, 0.5] },
+  card2:   { col: [104, 78, 46], a: 0.96, edge: [230, 178, 58, 0.42] },
+  pale:    { col: [150, 142, 122], a: 0.96, edge: [206, 198, 176, 0.5] },
+  dark:    { col: [42, 38, 30], a: 0.96, edge: [230, 178, 58, 0.4] },
+  pallet:  { col: [96, 71, 39], a: 0.97, edge: [201, 150, 70, 0.55] },
+  bollard: { col: [232, 190, 22], a: 1.0, edge: [16, 16, 16, 0.7] },
+  chassis: { col: [20, 20, 22], a: 0.98, edge: [255, 212, 0, 0.5] },
+  strip:   { col: [255, 246, 214], a: 0.9, flat: true },
+  lane:    { col: [230, 178, 58], a: 0.16, flat: true, edge: [230, 178, 58, 0.28] },
+  dock:    { col: [200, 60, 40], a: 0.14, flat: true, edge: [230, 120, 60, 0.3] },
+  pad:     { col: [70, 150, 120], a: 0.16, flat: true, edge: [90, 200, 160, 0.34] },
+};
+
+// eased view pose (10 Hz telem -> per-frame render); see feedSim() / frame()
+const view = { pose: [3, 4, 0], fork: 70, reach: 0, speed: 0, tel: null, have: false };
 
 function resizeCanvas() {
   const box = canvas.parentElement.getBoundingClientRect();
@@ -635,50 +671,94 @@ function resizeCanvas() {
 }
 window.addEventListener("resize", resizeCanvas);
 
-// box(x0,y0,z0, x1,y1,z1) -> top + 4 side faces (bottoms are never visible
-// from the mast camera)
-function boxFaces(x0, y0, z0, x1, y1, z1, fill, stroke) {
+// box(x0,y0,z0, x1,y1,z1, mat) -> top + 4 side faces, each with an explicit
+// outward normal so back-face culling & shading don't depend on winding
+// (bottoms are never visible from the mast camera).
+function boxFaces(x0, y0, z0, x1, y1, z1, mat) {
   const f = [];
-  const q = (pts) => f.push({ pts, fill, stroke });
-  q([[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]);        // top
-  q([[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]]);        // -y
-  q([[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]]);        // +y
-  q([[x0, y0, z0], [x0, y1, z0], [x0, y1, z1], [x0, y0, z1]]);        // -x
-  q([[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]]);        // +x
+  const q = (pts, n) => f.push({ pts, n, mat });
+  q([[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], [0, 0, 1]);   // top
+  q([[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]], [0, -1, 0]);  // -y
+  q([[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]], [0, 1, 0]);   // +y
+  q([[x0, y0, z0], [x0, y1, z0], [x0, y1, z1], [x0, y0, z1]], [-1, 0, 0]);  // -x
+  q([[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], [1, 0, 0]);   // +x
   return f;
 }
 
-const SCENE = (() => {
-  const f = [];
-  const wallFill = "rgba(15,15,18,0.96)", wallEdge = "rgba(244,243,239,0.16)";
-  const rackEdge = "rgba(255,212,0,0.5)", rackFill = "rgba(20,18,10,0.9)";
-  const boxFill = "rgba(28,24,18,0.95)", boxEdge = "rgba(230,178,58,0.45)";
-  // perimeter walls (h 2.4)
-  for (const [x0, y0, x1, y1] of [[0, 0, 12, 0.05], [0, 7.95, 12, 8], [0, 0, 0.05, 8], [11.95, 0, 12, 8]]) {
-    f.push(...boxFaces(x0, y0, 0, x1, y1, 2.4, wallFill, wallEdge));
+// a long box baked into ~seg-metre tiles along its dominant horizontal axis,
+// so painter-sorting by average depth stays correct for walls & floor bays
+function boxTiled(x0, y0, z0, x1, y1, z1, mat, seg) {
+  const f = [], dx = x1 - x0, dy = y1 - y0;
+  const n = Math.max(1, Math.round((dx >= dy ? dx : dy) / (seg || 1.0)));
+  for (let i = 0; i < n; i++) {
+    const a = i / n, b = (i + 1) / n;
+    if (dx >= dy) f.push(...boxFaces(x0 + dx * a, y0, z0, x0 + dx * b, y1, z1, mat));
+    else f.push(...boxFaces(x0, y0 + dy * a, z0, x1, y0 + dy * b, z1, mat));
   }
-  // dock stripe (floor marking)
-  f.push({ pts: [[0.05, 0.05, 0.004], [0.4, 0.05, 0.004], [0.4, 7.95, 0.004], [0.05, 7.95, 0.004]],
-           fill: "rgba(230,178,58,0.10)", stroke: "rgba(230,178,58,0.25)" });
-  // racks along the far wall: posts, two shelf slabs, product cases
-  for (const rx of [1.0, 6.5]) {
-    const x1 = rx + 4.5, y0 = 6.8, y1 = 7.75;
-    for (const px of [rx, rx + 2.25, x1 - 0.05]) {
-      f.push(...boxFaces(px, y0, 0, px + 0.05, y0 + 0.05, 1.7, rackFill, rackEdge));
-      f.push(...boxFaces(px, y1 - 0.05, 0, px + 0.05, y1, 1.7, rackFill, rackEdge));
-    }
-    for (const sz of [0.45, 1.15]) {
-      f.push(...boxFaces(rx, y0, sz, x1, y1, sz + 0.04, rackFill, rackEdge));
-    }
-    for (const [bx, bw, bz] of [[rx + 0.4, 0.38, 0.49], [rx + 1.5, 0.3, 0.49], [rx + 2.6, 0.35, 0.49],
-                                 [rx + 0.9, 0.32, 1.19], [rx + 2.9, 0.38, 1.19], [rx + 3.7, 0.3, 0.49]]) {
-      f.push(...boxFaces(bx, y0 + 0.15, bz, bx + bw, y0 + 0.15 + 0.55, bz + 0.28, boxFill, boxEdge));
-    }
-  }
-  // pallet + one staged case
-  f.push(...boxFaces(9.4, 1.0, 0, 10.62, 2.02, 0.145, "rgba(24,20,12,0.95)", "rgba(255,212,0,0.55)"));
-  f.push(...boxFaces(9.6, 1.2, 0.145, 10.0, 1.5, 0.395, boxFill, boxEdge));
   return f;
+}
+
+// a flat horizontal decal (floor marking / ceiling strip): a single two-sided
+// quad, normal up; `flat` materials are never culled or shaded
+function decal(x0, y0, x1, y1, z, mat) {
+  return [{ pts: [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]], n: [0, 0, 1], mat }];
+}
+
+const SCENE = (() => {
+  const F = [];
+  const add = (arr) => { for (let i = 0; i < arr.length; i++) F.push(arr[i]); };
+  const H = 2.6, TH = 0.08;                        // wall height / thickness
+
+  // perimeter shell, tiled ~1 m so it depth-sorts correctly against the racks
+  add(boxTiled(0, 0, 0, WORLD.w, TH, H, MAT.wall, 1.0));                     // south
+  add(boxTiled(0, WORLD.h - TH, 0, WORLD.w, WORLD.h, H, MAT.wall, 1.0));     // north (rack wall)
+  add(boxTiled(0, 0, 0, TH, WORLD.h, H, MAT.wall, 1.0));                     // west (dock)
+  add(boxTiled(WORLD.w - TH, 0, 0, WORLD.w, WORLD.h, H, MAT.wall, 1.0));     // east
+
+  // emissive ceiling light strips
+  for (const ly of [1.6, 4.0, 6.4]) add(decal(0.6, ly - 0.12, WORLD.w - 0.6, ly + 0.12, H - 0.05, MAT.strip));
+
+  // floor markings: two aisle lanes, the dock strip, a charge pad
+  for (const lx of [3.0, 9.0]) add(decal(lx - 0.06, 0.6, lx + 0.06, WORLD.h - 1.0, 0.006, MAT.lane));
+  add(decal(TH, 0.1, 0.55, WORLD.h - 0.1, 0.005, MAT.dock));
+  add(decal(9.9, 5.9, 11.1, 7.1, 0.005, MAT.pad));
+
+  // safety bollards flanking the dock lane
+  for (const by of [3.1, 4.9]) add(boxFaces(0.62, by - 0.06, 0, 0.74, by + 0.06, 0.72, MAT.bollard));
+
+  // pallet-rack rows along the far wall: uprights, two beam levels, product
+  const rackY0 = WORLD.h - TH - 0.9, rackY1 = WORLD.h - TH - 0.06;
+  const caseMats = [MAT.card, MAT.card2, MAT.pale, MAT.dark];
+  for (const [bx0, bx1] of [[0.8, 5.2], [6.6, 11.1]]) {
+    for (const px of [bx0, (bx0 + bx1) / 2 - 0.045, bx1 - 0.09]) {          // uprights (front/back legs)
+      add(boxFaces(px, rackY0, 0, px + 0.09, rackY0 + 0.09, 2.0, MAT.upright));
+      add(boxFaces(px, rackY1 - 0.09, 0, px + 0.09, rackY1, 2.0, MAT.upright));
+    }
+    for (const bz of [0.5, 1.22]) {                                         // load beams
+      add(boxFaces(bx0, rackY0, bz, bx1, rackY0 + 0.07, bz + 0.09, MAT.beam));
+      add(boxFaces(bx0, rackY1 - 0.07, bz, bx1, rackY1, bz + 0.09, MAT.beam));
+    }
+    let slot = 0;                                                          // product cases per shelf
+    for (const [lvl, hh] of [[0.59, 0.56], [1.31, 0.5]]) {
+      let cx = bx0 + 0.16;
+      while (cx < bx1 - 0.34) {
+        const w = 0.34 + 0.12 * (((slot * 7) % 5) / 4);                    // deterministic jitter
+        const dd = 0.5 + 0.05 * ((slot * 5) % 3);
+        add(boxFaces(cx, rackY0 + 0.11, lvl, cx + w, rackY0 + 0.11 + dd, lvl + hh, caseMats[slot % 4]));
+        cx += w + 0.13; slot++;
+      }
+    }
+  }
+
+  // staged pallets with box stacks out on the floor
+  const stack = (x, y, m) => {
+    add(boxFaces(x, y, 0, x + 1.2, y + 1.0, 0.14, MAT.pallet));            // pallet
+    add(boxFaces(x + 0.08, y + 0.08, 0.14, x + 1.12, y + 0.92, 0.62, m));  // lower case
+    add(boxFaces(x + 0.22, y + 0.18, 0.62, x + 0.86, y + 0.72, 1.04, MAT.card)); // upper case
+  };
+  stack(4.2, 1.5, MAT.card2);
+  stack(7.8, 2.3, MAT.pale);
+  return F;
 })();
 
 // floor grid, 1 m pitch
@@ -693,22 +773,74 @@ function robotFaces(t) {
   const [rx, ry, rh] = t.pose;
   const c = Math.cos(rh), s = Math.sin(rh);
   const W = (lx, ly, lz) => [rx + lx * c - ly * s, ry + lx * s + ly * c, lz];
+  const Rn = (n) => [n[0] * c - n[1] * s, n[0] * s + n[1] * c, n[2]];   // rotate normal into world
   const lift = t.fork_mm / 1000;
   const f = [];
-  const forkFill = `rgba(255,212,0,${(0.3 + clamp(lift / 0.87, 0, 1) * 0.4).toFixed(2)})`;
-  const mk = (x0, y0, z0, x1, y1, z1, fill, stroke) => {
-    // local-space box -> world quads (top + sides), reusing boxFaces on
-    // local coords then mapping corners through W()
-    for (const face of boxFaces(x0, y0, z0, x1, y1, z1, fill, stroke)) {
-      f.push({ pts: face.pts.map((p) => W(p[0], p[1], p[2])), fill: face.fill, stroke: face.stroke });
+  // fork blades brighten as they rise, so the lift reads at a glance
+  const fork = { col: [255, 212, 0], a: 0.34 + clamp(lift / 0.87, 0, 1) * 0.5, edge: [255, 212, 0, 0.95] };
+  const mk = (x0, y0, z0, x1, y1, z1, mat) => {
+    // local-space box -> world quads, mapping corners through W() and normals through Rn()
+    for (const face of boxFaces(x0, y0, z0, x1, y1, z1, mat)) {
+      f.push({ pts: face.pts.map((p) => W(p[0], p[1], p[2])), n: Rn(face.n), mat: face.mat });
     }
   };
-  mk(0.385, 0.123, lift - 0.025, 0.785, 0.203, lift, forkFill, "rgba(255,212,0,0.95)");     // left blade
-  mk(0.385, -0.203, lift - 0.025, 0.785, -0.123, lift, forkFill, "rgba(255,212,0,0.95)");   // right blade
-  mk(0.30, -0.23, lift + 0.05, 0.37, 0.23, lift + 0.13, "rgba(16,16,16,0.95)", "rgba(255,212,0,0.7)"); // W beam
+  mk(0.02, -0.26, 0.06, 0.34, 0.26, 0.34, MAT.chassis);                 // chassis apron under the camera
+  mk(0.30, -0.23, lift + 0.05, 0.37, 0.23, lift + 0.13, MAT.chassis);   // carriage cross-beam
+  mk(0.385, 0.123, lift - 0.025, 0.785, 0.203, lift, fork);             // left blade
+  mk(0.385, -0.203, lift - 0.025, 0.785, -0.123, lift, fork);           // right blade
   return f;
 }
 
+// Lambert key light + distance fog -> a css fill for one face; `flat`
+// materials (decals, emissive strips) skip the lighting term.
+function faceColor(mat, n, depth) {
+  let r = mat.col[0], g = mat.col[1], b = mat.col[2];
+  if (!mat.flat) {
+    const lam = AMBIENT + DIFFUSE * Math.max(0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2]);
+    r *= lam; g *= lam; b *= lam;
+  }
+  const ft = clamp((depth - FOG_NEAR) / (FOG_FAR - FOG_NEAR), 0, 1) * FOG_MAX;
+  r += (FOG[0] - r) * ft; g += (FOG[1] - g) * ft; b += (FOG[2] - b) * ft;
+  return `rgba(${r | 0},${g | 0},${b | 0},${mat.a})`;
+}
+function edgeColor(edge, depth) {
+  const ft = clamp((depth - FOG_NEAR) / (FOG_FAR - FOG_NEAR), 0, 1) * FOG_MAX;
+  return `rgba(${edge[0] | 0},${edge[1] | 0},${edge[2] | 0},${(edge[3] * (1 - ft)).toFixed(3)})`;
+}
+
+// one face -> screen: back-face cull, near-plane clip, shade, queue for sort
+function collectFace(face, toCam, proj, cam, out) {
+  const mat = face.mat;
+  if (!mat.flat) {                                   // back-face cull (skip two-sided decals)
+    let ax = 0, ay = 0, az = 0;
+    for (const p of face.pts) { ax += p[0]; ay += p[1]; az += p[2]; }
+    const k = 1 / face.pts.length;
+    if (face.n[0] * (ax * k - cam[0]) + face.n[1] * (ay * k - cam[1]) + face.n[2] * (az * k - cam[2]) > 0) return;
+  }
+  const cams = face.pts.map(toCam);
+  if (cams.every((c) => c[0] <= CAM.near)) return;
+  let poly = cams;
+  if (cams.some((c) => c[0] <= CAM.near)) {
+    poly = [];
+    for (let i = 0; i < cams.length; i++) {
+      const a = cams[i], b = cams[(i + 1) % cams.length];
+      const ain = a[0] > CAM.near, bin = b[0] > CAM.near;
+      if (ain) poly.push(a);
+      if (ain !== bin) {
+        const k = (CAM.near - a[0]) / (b[0] - a[0]);
+        poly.push([CAM.near, a[1] + k * (b[1] - a[1]), a[2] + k * (b[2] - a[2])]);
+      }
+    }
+    if (poly.length < 3) return;
+  }
+  let depth = 0;
+  for (const c of poly) depth += c[0];
+  depth /= poly.length;
+  out.push({ depth, pts2: poly.map(proj), fill: faceColor(mat, face.n, depth),
+             stroke: mat.edge ? edgeColor(mat.edge, depth) : null });
+}
+
+let _lastDrawTs = 0;   // wall-clock ms of the last paint, for the rAF watchdog
 function drawScene(t) {
   // self-heal: the canvas gets sized while hidden (rect 0) on view switches
   const want = Math.round(canvas.parentElement.getBoundingClientRect().width * devicePixelRatio);
@@ -716,7 +848,7 @@ function drawScene(t) {
   const [rx, ry, rh] = t.pose;
   const cW = canvas.width, cH = canvas.height;
   const cx = cW / 2, cy = cH / 2;
-  const f = cH * 0.9;
+  const f = cH * 0.86;
   const cosH = Math.cos(rh), sinH = Math.sin(rh);
   const camX = rx + CAM.lx * cosH, camY = ry + CAM.lx * sinH;
   const cosP = Math.cos(CAM.pitch), sinP = Math.sin(CAM.pitch);
@@ -730,16 +862,17 @@ function drawScene(t) {
   };
   const proj = (c) => [cx - f * (c[1] / c[0]), cy - f * (c[2] / c[0])];
 
-  // sky / floor split at the horizon
+  // ceiling / floor split at the horizon, each a soft vertical gradient
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const horizon = cy - f * Math.tan(CAM.pitch);
-  ctx.fillStyle = "#0c0c10";
-  ctx.fillRect(0, 0, cW, Math.max(0, horizon));
-  ctx.fillStyle = "#0a0a0a";
-  ctx.fillRect(0, Math.max(0, horizon), cW, cH);
+  const ceil = ctx.createLinearGradient(0, 0, 0, Math.max(1, horizon));
+  ceil.addColorStop(0, "#050507"); ceil.addColorStop(1, "#0e0e13");
+  ctx.fillStyle = ceil; ctx.fillRect(0, 0, cW, Math.max(0, horizon));
+  const floor = ctx.createLinearGradient(0, Math.max(0, horizon), 0, cH);
+  floor.addColorStop(0, "#0b0b10"); floor.addColorStop(0.5, "#090909"); floor.addColorStop(1, "#050505");
+  ctx.fillStyle = floor; ctx.fillRect(0, Math.max(0, horizon), cW, cH);
 
-  // grid (clipped to the near plane per segment)
-  ctx.strokeStyle = "rgba(255,255,255,0.05)";
+  // floor grid (near-clipped per segment, fading into the fog)
   ctx.lineWidth = 1;
   for (const [a, b] of GRID) {
     let ca = toCam(a), cb = toCam(b);
@@ -749,54 +882,97 @@ function drawScene(t) {
       const mid = [CAM.near, ca[1] + k * (cb[1] - ca[1]), ca[2] + k * (cb[2] - ca[2])];
       if (ca[0] <= CAM.near) ca = mid; else cb = mid;
     }
+    const dep = (ca[0] + cb[0]) / 2;
+    ctx.strokeStyle = `rgba(255,255,255,${(0.16 * (1 - clamp((dep - 1) / 12, 0, 1))).toFixed(3)})`;
     const pa = proj(ca), pb = proj(cb);
     ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
   }
 
-  // faces: transform, near-clip, painter-sort far -> near
-  const out = [];
-  for (const face of [...SCENE, ...robotFaces(t)]) {
-    const cams = face.pts.map(toCam);
-    if (cams.every((c) => c[0] <= CAM.near)) continue;
-    let poly = cams;
-    if (cams.some((c) => c[0] <= CAM.near)) {
-      poly = [];
-      for (let i = 0; i < cams.length; i++) {
-        const a = cams[i], b = cams[(i + 1) % cams.length];
-        const ain = a[0] > CAM.near, bin = b[0] > CAM.near;
-        if (ain) poly.push(a);
-        if (ain !== bin) {
-          const k = (CAM.near - a[0]) / (b[0] - a[0]);
-          poly.push([CAM.near, a[1] + k * (b[1] - a[1]), a[2] + k * (b[2] - a[2])]);
-        }
-      }
-      if (poly.length < 3) continue;
-    }
-    let depth = 0;
-    for (const c of poly) depth += c[0];
-    out.push({ depth: depth / poly.length, pts2: poly.map(proj), fill: face.fill, stroke: face.stroke });
-  }
+  // faces: cull, clip, shade, painter-sort far -> near
+  const cam = [camX, camY, CAM.z], out = [];
+  for (const face of SCENE) collectFace(face, toCam, proj, cam, out);
+  for (const face of robotFaces(t)) collectFace(face, toCam, proj, cam, out);
   out.sort((a, b) => b.depth - a.depth);
-  ctx.lineWidth = 1.2;
   ctx.lineJoin = "round";
-  for (const face of out) {
+  for (const o of out) {
     ctx.beginPath();
-    face.pts2.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    o.pts2.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
     ctx.closePath();
-    if (face.fill) { ctx.fillStyle = face.fill; ctx.fill(); }
-    if (face.stroke) { ctx.strokeStyle = face.stroke; ctx.stroke(); }
+    ctx.fillStyle = o.fill; ctx.fill();
+    if (o.stroke) { ctx.lineWidth = 1.1; ctx.strokeStyle = o.stroke; ctx.stroke(); }
   }
 
-  // subtle camera vignette + reticle
-  ctx.strokeStyle = "rgba(255,212,0,0.25)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(cx - 14, cy); ctx.lineTo(cx - 4, cy);
-  ctx.moveTo(cx + 4, cy); ctx.lineTo(cx + 14, cy);
-  ctx.moveTo(cx, cy - 14); ctx.lineTo(cx, cy - 4);
-  ctx.moveTo(cx, cy + 4); ctx.lineTo(cx, cy + 14);
-  ctx.stroke();
+  drawOverlay(cW, cH, cx, cy);
+  _lastDrawTs = performance.now();
 }
+
+// camera-feed HUD: vignette, corner frame ticks, center reticle
+function drawOverlay(cW, cH, cx, cy) {
+  const vg = ctx.createRadialGradient(cx, cy, Math.min(cW, cH) * 0.26, cx, cy, Math.max(cW, cH) * 0.62);
+  vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, "rgba(0,0,0,0.55)");
+  ctx.fillStyle = vg; ctx.fillRect(0, 0, cW, cH);
+
+  const dp = devicePixelRatio || 1, m = 15 * dp, len = 16 * dp;
+  ctx.strokeStyle = "rgba(255,212,0,0.5)"; ctx.lineWidth = 1.4 * dp;
+  for (const [ox, oy, sx, sy] of [[m, m, 1, 1], [cW - m, m, -1, 1], [m, cH - m, 1, -1], [cW - m, cH - m, -1, -1]]) {
+    ctx.beginPath();
+    ctx.moveTo(ox, oy + sy * len); ctx.lineTo(ox, oy); ctx.lineTo(ox + sx * len, oy);
+    ctx.stroke();
+  }
+  const r0 = 4 * dp, r1 = 15 * dp;
+  ctx.strokeStyle = "rgba(255,212,0,0.6)"; ctx.lineWidth = 1 * dp;
+  ctx.beginPath();
+  ctx.moveTo(cx - r1, cy); ctx.lineTo(cx - r0, cy);
+  ctx.moveTo(cx + r0, cy); ctx.lineTo(cx + r1, cy);
+  ctx.moveTo(cx, cy - r1); ctx.lineTo(cx, cy - r0);
+  ctx.moveTo(cx, cy + r0); ctx.lineTo(cx, cy + r1);
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(255,212,0,0.22)";
+  ctx.beginPath(); ctx.arc(cx, cy, r1, 0, Math.PI * 2); ctx.stroke();
+}
+
+/* Smooth the 10 Hz telemetry up to display rate: renderTelem feeds the latest
+   target, and a rAF loop eases the view pose toward it (heading by shortest
+   arc) before redrawing — so panning the mast camera reads fluid, not steppy. */
+function feedSim(t) {
+  if (!view.have) { view.pose = [t.pose[0], t.pose[1], t.pose[2]]; view.fork = t.fork_mm; view.reach = t.y_mm; }
+  view.tel = t; view.have = true;
+  // watchdog: if the rAF loop hasn't painted recently (window backgrounded or
+  // otherwise throttled), snap to the latest telemetry and paint here so the
+  // feed can never freeze. In the normal case rAF paints every ~16 ms and this
+  // never fires, leaving the smooth path untouched.
+  if (performance.now() - _lastDrawTs > 200 &&
+      document.body.dataset.view === "console" && state.robot && state.robot.kind === "sim") {
+    view.pose = [t.pose[0], t.pose[1], t.pose[2]];
+    view.fork = t.fork_mm; view.reach = t.y_mm; view.speed = t.speed || 0;
+    drawScene({ pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed });
+  }
+}
+function angLerp(cur, tgt, k) {
+  let d = tgt - cur;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return cur + d * k;
+}
+let _lastFrame = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const on = document.body.dataset.view === "console" && state.robot &&
+             state.robot.kind === "sim" && view.have && view.tel && view.tel.pose;
+  if (!on) { _lastFrame = 0; return; }
+  const dt = _lastFrame ? Math.min(0.05, (ts - _lastFrame) / 1000) : 0.016;
+  _lastFrame = ts;
+  const k = 1 - Math.pow(0.0025, dt);                 // ~120 ms time constant
+  const tp = view.tel.pose;
+  view.pose[0] += (tp[0] - view.pose[0]) * k;
+  view.pose[1] += (tp[1] - view.pose[1]) * k;
+  view.pose[2] = angLerp(view.pose[2], tp[2], k);
+  view.fork += (view.tel.fork_mm - view.fork) * k;
+  view.reach += (view.tel.y_mm - view.reach) * k;
+  view.speed += ((view.tel.speed || 0) - view.speed) * k;
+  drawScene({ pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed });
+}
+requestAnimationFrame(frame);
 
 /* ---------- boot ---------- */
 // Liveness: hold a stream open so the desktop shell knows this window is up.
