@@ -3,7 +3,7 @@
 57,600 baud 8N1. ASCII lines, NMEA-style framing so it's debuggable in any
 serial monitor. ESP32→Uno lines start `>`; Uno→ESP32 lines start `<`.
 Frame: `>BODY*HH\n` where HH = two-digit hex XOR of every BODY character.
-A bad checksum or malformed frame latches `FAULT(F_SERIAL)` — by design:
+A bad checksum or malformed frame latches `FAULT(F_SERIAL)`. That's deliberate:
 a corrupted link is a safety event, not a retry event.
 
 **Watchdog:** ANY valid frame feeds the 300 ms watchdog. The ESP32 must send
@@ -33,6 +33,6 @@ latching FAULT, Z brake clamps, throttles zero, hub brakes on.
 - cap: current hub throttle cap % (0 in BOOT/HOMING/FAULT, 40 raised, 100 normal)
 
 ## Record/replay (console side)
-A recorded primitive is simply a stored list of `ZP`/`YP`/`DRV` frames with
-timestamps. The motion controller needs no changes: position moves + homing
-+ step-count feedback are already the whole execution substrate.
+A recorded primitive is just a stored list of `ZP`/`YP`/`DRV` frames with
+timestamps. The motion controller needs no changes — position moves, homing,
+and step-count feedback are already the whole execution substrate.
