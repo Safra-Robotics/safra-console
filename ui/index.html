@@ -69,6 +69,7 @@
     <div class="topbar-title">SELECT ROBOT</div>
     <div class="topbar-right">
       <span class="op-badge" id="robots-op-badge"></span>
+      <button class="btn btn-ghost" id="btn-tasks-robots">Pick tasks</button>
       <button class="btn btn-ghost" id="btn-logout">Sign out</button>
     </div>
   </header>
@@ -155,6 +156,38 @@
         </div>
       </div>
 
+      <div class="panel" id="task-panel">
+        <div class="panel-title panel-title-row">PICK TASK
+          <button class="btn btn-ghost btn-map" id="btn-tasks">DASHBOARD</button>
+        </div>
+        <div class="task-empty" id="task-empty">No active pick job — open the dashboard to import or start one.</div>
+        <div id="task-active" hidden>
+          <div class="task-name" id="task-name"></div>
+          <div class="task-progress"><div class="task-progress-fill" id="task-fill"></div></div>
+          <div class="task-counts" id="task-counts"></div>
+          <div id="task-pick">
+            <div class="task-sku" id="task-sku"></div>
+            <div class="task-desc" id="task-desc"></div>
+            <div class="task-slots">
+              <span>SLOT</span><b id="task-loc"></b>
+              <span>QTY</span><b id="task-qty"></b>
+              <span>STOP</span><b id="task-stop"></b>
+            </div>
+            <div class="task-actions">
+              <button class="btn btn-cta" id="btn-case-placed">CASE PLACED</button>
+              <button class="btn btn-ghost" id="btn-quarantine" title="damaged / un-pickable — flag it, skip it, keep building">QUARANTINE</button>
+            </div>
+          </div>
+          <div id="task-complete" hidden>
+            <div class="task-complete-msg" id="task-complete-msg"></div>
+            <div class="task-actions">
+              <button class="btn btn-cta" id="btn-loader-label">LOADER LABEL</button>
+              <button class="btn btn-ghost" id="btn-job-complete">CLOSE JOB</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-title panel-title-row">DRIVE
           <span class="gp-dot" id="gp-dot" title="gamepad">GAMEPAD</span>
@@ -203,6 +236,79 @@
     <div class="modal-foot">
       <button class="btn btn-ghost" id="bind-reset">Reset to defaults</button>
       <div class="capture-hint" id="capture-hint">Click ＋ on a row, then press a key, press a gamepad button, or move a stick. Click a chip to remove it.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ PICK TASKS DASHBOARD ============ -->
+<div id="tasks-modal" class="modal" hidden>
+  <div class="modal-card modal-card--wide">
+    <div class="modal-head">
+      <div class="panel-title">PICK TASKS · WMS DASHBOARD</div>
+      <span class="chip" id="printer-chip">PRINTER OFF</span>
+      <button class="btn btn-ghost" id="tasks-close">Close</button>
+    </div>
+    <div class="tasks-body">
+
+      <div class="tasks-left">
+        <div class="tasks-section-title">JOBS</div>
+        <div class="job-list" id="job-list"></div>
+        <div class="tasks-section-title">IMPORT · JSON OR CSV</div>
+        <textarea id="import-text" rows="5" spellcheck="false"
+          placeholder='Paste a WMS export — JSON: {"route":"12","pallet":"A","picks":[{"sku":"104620","desc":"MARINARA 6/#10","qty":1,"location":"DA-03-1","stop":"4"}]} — or CSV with a header row: sku,desc,qty,location,stop,route,pallet'></textarea>
+        <div class="tasks-import-row">
+          <input type="file" id="import-file" accept=".json,.csv,.txt" hidden>
+          <button class="btn btn-ghost" id="btn-import-file" type="button">Load file…</button>
+          <button class="btn btn-ghost" id="btn-demo" type="button">Demo job</button>
+          <button class="btn btn-cta" id="btn-import" type="button">Import</button>
+        </div>
+        <div class="form-error" id="tasks-error"></div>
+      </div>
+
+      <div class="tasks-right">
+        <div class="job-detail-empty" id="job-detail-empty">Select a job on the left — or import one — to see its picks.</div>
+        <div id="job-detail" hidden>
+          <div class="job-detail-head">
+            <div class="job-detail-title">
+              <div class="job-detail-name" id="jd-name"></div>
+              <div class="job-detail-meta" id="jd-meta"></div>
+            </div>
+            <div class="job-detail-actions">
+              <button class="btn btn-cta" id="jd-activate">Start picking</button>
+              <button class="btn btn-ghost" id="jd-loader" title="print the pallet loader label">Loader label</button>
+              <button class="btn btn-ghost" id="jd-complete">Close job</button>
+              <button class="btn btn-ghost" id="jd-delete">Delete</button>
+            </div>
+          </div>
+          <div class="pick-table-wrap">
+            <table class="pick-table">
+              <thead><tr><th>#</th><th>SKU</th><th>DESCRIPTION</th><th>QTY</th><th>SLOT</th><th>STOP</th><th>STATUS</th><th>TAG</th><th></th></tr></thead>
+              <tbody id="pick-rows"></tbody>
+            </table>
+          </div>
+          <div class="label-preview" id="label-preview" hidden>
+            <div class="label-preview-head">
+              <span class="tasks-section-title">LABEL PREVIEW</span>
+              <button class="btn btn-ghost" id="label-preview-close">Hide</button>
+            </div>
+            <div class="label-flex">
+              <div class="label-card" id="label-card"></div>
+              <pre class="label-zpl" id="label-zpl"></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="tasks-section-title">LABEL PRINTER · ZPL OVER TCP</div>
+        <form id="printer-form" class="printer-form">
+          <label class="field"><span>Host</span><input id="pr-host" placeholder="192.168.1.60" autocomplete="off"></label>
+          <label class="field"><span>Port</span><input id="pr-port" inputmode="numeric" placeholder="9100" autocomplete="off"></label>
+          <label class="printer-enabled"><input type="checkbox" id="pr-enabled"> <span>printing enabled</span></label>
+          <button class="btn btn-cta" type="submit">Save</button>
+          <button class="btn btn-ghost" type="button" id="pr-test">Test print</button>
+        </form>
+        <div class="printer-hint" id="printer-status">Case tags print as each case is placed; the loader label prints when the pallet is done. A dead printer never stops picking — the pallet is flagged instead. Tag layouts are site-specific: the defaults are placeholders, and custom ZPL templates load via the printer config (see README).</div>
+      </div>
+
     </div>
   </div>
 </div>

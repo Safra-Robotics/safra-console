@@ -17,9 +17,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+import labels
 import stores
 import updater
 import version
+import wms
 from links import SimLink, TcpLink
 
 # PyInstaller unpacks bundled data (ui/) under sys._MEIPASS; a source checkout
@@ -106,6 +108,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not signed in"}, 401)
         return op
 
+    def _send_label(self, render_fn):
+        """Render + send one label per the printer config. Returns
+        (status, detail): printed / failed / off (off = printer disabled —
+        by policy a missing or dead printer never stops picking)."""
+        cfg = labels.config()
+        if not cfg["enabled"]:
+            return "off", "printer disabled — label skipped"
+        try:
+            zpl = render_fn(cfg)
+        except labels.TemplateError as e:
+            return "failed", str(e)
+        ok, detail = labels.send(zpl, cfg)
+        return ("printed" if ok else "failed"), detail
+
     def _static(self, path):
         if path == "/":
             path = "/index.html"
@@ -163,6 +179,7 @@ class Handler(BaseHTTPRequestHandler):
                     "robot": robot,
                     "telem": telem,
                     "events": events,
+                    "job": wms.active_summary(),
                 }
                 self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
                 self.wfile.flush()
@@ -220,6 +237,42 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/update/status":
             if self._auth():
                 self._json(updater.status())
+        elif u.path == "/api/jobs":
+            if self._auth():
+                self._json({"jobs": wms.list_jobs()})
+        elif u.path == "/api/jobs/detail":
+            if self._auth():
+                q = parse_qs(u.query)
+                job = wms.get_job((q.get("id") or [""])[0])
+                self._json({"job": job} if job else {"error": "unknown job"},
+                           200 if job else 404)
+        elif u.path == "/api/labels/preview":
+            if self._auth():
+                q = parse_qs(u.query)
+                job = wms.get_job((q.get("id") or [""])[0])
+                if not job:
+                    self._json({"error": "unknown job"}, 404)
+                    return
+                seq = (q.get("seq") or [""])[0]
+                try:
+                    if seq == "loader":
+                        fields = labels.loader_fields(job)
+                        zpl = labels.loader_zpl(job)
+                    else:
+                        pick = next((p for p in job["picks"]
+                                     if str(p["seq"]) == seq), None)
+                        if not pick:
+                            self._json({"error": "unknown pick"}, 404)
+                            return
+                        fields = labels.case_fields(job, pick)
+                        zpl = labels.case_zpl(job, pick)
+                except labels.TemplateError as e:
+                    self._json({"error": str(e)}, 400)
+                    return
+                self._json({"fields": fields, "zpl": zpl})
+        elif u.path == "/api/printer":
+            if self._auth():
+                self._json({"printer": labels.config()})
         elif u.path.startswith("/api/"):
             self._json({"error": "not found"}, 404)
         else:
@@ -303,6 +356,181 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/update/check":
             if self._auth():
                 self._json(updater.check())
+
+        # --- pick jobs / labels ------------------------------------------------
+
+        elif u.path == "/api/jobs/import":
+            op = self._auth()
+            if not op:
+                return
+            jobs, err = wms.import_text(b.get("text", ""))
+            if err:
+                self._json({"error": err}, 400)
+                return
+            added = wms.add_jobs(jobs)
+            APP.log.add("task", "imported {} pick job{}".format(
+                len(added), "" if len(added) == 1 else "s"), operator=op["name"])
+            self._json({"ok": True, "jobs": added})
+
+        elif u.path == "/api/jobs/demo":
+            op = self._auth()
+            if not op:
+                return
+            added = wms.add_jobs([wms.demo_job()])
+            APP.log.add("task", "demo pick job created", operator=op["name"])
+            self._json({"ok": True, "jobs": added})
+
+        elif u.path == "/api/jobs/activate":
+            op = self._auth()
+            if not op:
+                return
+            s, err = wms.activate(b.get("id", ""))
+            if err:
+                self._json({"error": err}, 400)
+                return
+            APP.log.add("task", "pick job started: {}".format(s["name"]),
+                        operator=op["name"])
+            self._json({"ok": True, "job": s})
+
+        elif u.path == "/api/jobs/delete":
+            if not self._auth():
+                return
+            self._json({"ok": wms.delete_job(b.get("id", ""))})
+
+        elif u.path == "/api/jobs/complete":
+            op = self._auth()
+            if not op:
+                return
+            s, err = wms.complete_job(b.get("id", ""))
+            if err:
+                self._json({"error": err}, 400)
+                return
+            APP.log.add("task", "pallet build complete: {} ({}/{} cases{})".format(
+                s["name"], s["picked"], s["total"],
+                ", FLAGGED" if s["flagged"] else ""), operator=op["name"])
+            self._json({"ok": True, "job": s})
+
+        elif u.path == "/api/jobs/loader_label":
+            op = self._auth()
+            if not op:
+                return
+            job = wms.get_job(b.get("id", ""))
+            if not job:
+                self._json({"error": "unknown job"}, 404)
+                return
+            status, detail = self._send_label(
+                lambda cfg: labels.loader_zpl(job, op["name"], cfg))
+            wms.set_loader_label(job["id"], status)
+            APP.log.add("label", "loader label {} — {}".format(
+                "printed" if status == "printed" else status, detail),
+                operator=op["name"])
+            self._json({"ok": status == "printed", "label": status,
+                        "detail": detail})
+
+        elif u.path == "/api/picks/complete":
+            op = self._auth()
+            if not op:
+                return
+            job, pick, err = wms.set_pick(b.get("id", ""), b.get("seq"),
+                                          "picked", expect="pending")
+            if err:
+                self._json({"error": err}, 400)
+                return
+            status, detail = self._send_label(
+                lambda cfg: labels.case_zpl(job, pick, cfg))
+            wms.set_pick_label(job["id"], pick["seq"], status)
+            APP.log.add("task", "case {}/{} placed — {} ({})".format(
+                pick["seq"], len(job["picks"]), pick["sku"],
+                pick["desc"] or "case"), operator=op["name"],
+                robot=APP.robot["name"] if APP.robot else None)
+            if status == "failed":
+                APP.log.add("label", "case tag FAILED — pallet flagged, "
+                            "picking continues ({})".format(detail),
+                            operator=op["name"])
+            elif status == "printed":
+                APP.log.add("label", "case tag printed — {}".format(pick["sku"]),
+                            operator=op["name"])
+            self._json({"ok": True, "label": status, "detail": detail})
+
+        elif u.path == "/api/picks/quarantine":
+            op = self._auth()
+            if not op:
+                return
+            job, pick, err = wms.set_pick(b.get("id", ""), b.get("seq"),
+                                          "quarantined", b.get("note", ""),
+                                          expect="pending")
+            if err:
+                self._json({"error": err}, 400)
+                return
+            APP.log.add("task", "case {} QUARANTINED — pallet flagged for the "
+                        "wrap crew{}".format(
+                            pick["sku"],
+                            ": " + pick["note"] if pick["note"] else ""),
+                        operator=op["name"],
+                        robot=APP.robot["name"] if APP.robot else None)
+            self._json({"ok": True})
+
+        elif u.path == "/api/picks/reopen":
+            op = self._auth()
+            if not op:
+                return
+            job, pick, err = wms.set_pick(b.get("id", ""), b.get("seq"),
+                                          "pending", label="none")
+            if err:
+                self._json({"error": err}, 400)
+                return
+            APP.log.add("task", "case {} reopened".format(pick["sku"]),
+                        operator=op["name"])
+            self._json({"ok": True})
+
+        elif u.path == "/api/labels/reprint":
+            op = self._auth()
+            if not op:
+                return
+            job = wms.get_job(b.get("id", ""))
+            pick = next((p for p in job["picks"]
+                         if str(p["seq"]) == str(b.get("seq"))), None) if job else None
+            if not pick:
+                self._json({"error": "unknown pick"}, 404)
+                return
+            status, detail = self._send_label(
+                lambda cfg: labels.case_zpl(job, pick, cfg))
+            wms.set_pick_label(job["id"], pick["seq"], status)
+            APP.log.add("label", "case tag reprint {} — {} ({})".format(
+                status, pick["sku"], detail), operator=op["name"])
+            self._json({"ok": status == "printed", "label": status,
+                        "detail": detail})
+
+        elif u.path == "/api/printer":
+            op = self._auth()
+            if not op:
+                return
+            # validate custom templates before saving, so a bad one fails
+            # loudly here instead of silently at 2 a.m. on the pick floor
+            try:
+                dj = wms.demo_job()
+                if b.get("case_template"):
+                    labels.render(b["case_template"],
+                                  labels.case_fields(dj, dj["picks"][0]))
+                if b.get("loader_template"):
+                    labels.render(b["loader_template"], labels.loader_fields(dj))
+            except labels.TemplateError as e:
+                self._json({"error": str(e)}, 400)
+                return
+            cfg = labels.save_config(b)
+            APP.log.add("label", "printer config saved — {}".format(
+                "{}:{} enabled".format(cfg["host"], cfg["port"])
+                if cfg["enabled"] else "disabled"), operator=op["name"])
+            self._json({"ok": True, "printer": cfg})
+
+        elif u.path == "/api/printer/test":
+            op = self._auth()
+            if not op:
+                return
+            ok, detail = labels.send(labels.test_zpl())
+            APP.log.add("label", "printer test — {}".format(detail),
+                        operator=op["name"])
+            self._json({"ok": ok, "detail": detail})
 
         elif u.path == "/api/disconnect":
             op = self._auth()

@@ -84,6 +84,62 @@ libraries — with a floor grid, walls, racking full of cases, a pallet drop
 zone, and the robot's own fork blades rising through the frame as you lift.
 Field robots show a placeholder here until live video ships.
 
+## Pick tasks & label printing (WMS integration)
+
+Warehouses that direct case picking from handheld scanners also print a tag
+for every case and a loader label for every finished pallet — so a
+robot-built pallet has to come out labeled the same way, or someone ends up
+downstacking it just to tag it. The console carries that flow end to end:
+
+- **Pick jobs.** A job is one pallet build for a delivery route: an ordered
+  list of case picks (reverse drop sequence — the first stop rides on top),
+  each with a SKU, description, quantity, and slot. Open the **PICK TASKS**
+  dashboard (button on the robot-select screen, or DASHBOARD in the console
+  sidebar) to import jobs from a WMS export — JSON or CSV, pasted or loaded
+  from a file — or generate the built-in demo job to try it.
+- **Working the queue.** With a job active, the PICK TASK panel in the
+  console sidebar shows the current case (SKU, slot, qty, stop) and live
+  progress. **CASE PLACED** — also Enter, or gamepad **A**, remappable like
+  any binding — confirms the case and prints its tag; **QUARANTINE** flags
+  and skips a damaged or un-pickable case so the build keeps moving, and the
+  pallet is marked for a follow-up check. When every case is handled, print
+  the pallet's loader label and close the job. Everything lands in the
+  session log under the operator's name.
+- **Labels.** Case tags and loader labels render as ZPL and go raw over TCP
+  to a networked label printer (host + port in the dashboard; 9100 is the
+  usual raw-ZPL port — the label preview shows the exact ZPL either way). A
+  dead or missing printer never stops picking: the pick still completes, the
+  pallet is flagged, and the log carries the reason. Tag layouts are
+  site-specific, so the built-in templates are readable placeholders — real
+  ones drop in as `case_template` / `loader_template` (ZPL with `{field}`
+  placeholders) via `POST /api/printer` or `data/printer.json`.
+
+Import formats:
+
+```json
+{
+  "name": "Route 12 · Pallet A",
+  "route": "12", "pallet": "A",
+  "picks": [
+    {"sku": "104620", "desc": "MARINARA SAUCE 6/#10", "qty": 1,
+     "location": "DA-03-1", "stop": "4", "barcode": "LP000123"}
+  ]
+}
+```
+
+JSON can be one job, a list of jobs, or `{"jobs": [...]}`; `stop` and
+`barcode` are optional per pick. The same fields work as CSV with a header
+row, one pick per line (`route`/`pallet` are read from the first row):
+
+```csv
+sku,desc,qty,location,stop,route,pallet
+104620,MARINARA SAUCE 6/#10,1,DA-03-1,4,12,A
+```
+
+There's no live WMS connection yet — jobs come in by paste/file until a
+site's export or API is wired up, which is why the import side is kept
+adapter-shaped: a new source only has to map onto these fields.
+
 ## Building the installer & auto-update
 
 `python tools/build_installer.py` does the whole packaging run: it bundles
@@ -109,6 +165,7 @@ ui/  (HTML / CSS / JS, Safra brand)
 server.py  (Python standard-library http.server)
   ├─ SimLink → sim.py            the built-in test robot
   ├─ TcpLink → host:port         protocol v1 over TCP → robot UART
+  ├─ wms.py / labels.py          pick jobs → ZPL case tags + loader labels → printer (TCP 9100)
   └─ updater.py → release feed   (installed builds only)
 ```
 
@@ -126,6 +183,9 @@ let go, which mirrors the protocol's own streaming behavior.
   not a camera.
 - The field-link path has been verified with a loopback test against the
   protocol, but not yet against physical hardware.
+- Pick jobs are imported (JSON/CSV), not fetched live from a WMS, and the
+  built-in label templates are generic placeholders — both are meant to be
+  fitted to a site's real export and tag spec.
 
 ---
 

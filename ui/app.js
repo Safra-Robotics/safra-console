@@ -31,14 +31,15 @@ const DEFAULT_BINDINGS = {
     "estop":  [{ key: "x" }, { btn: 2 }],
     "home":   [{ key: "h" }, { btn: 3 }],
     "creep":  [{ key: "shift" }, { btn: 4 }],
+    "pick":   [{ key: "enter" }, { btn: 0 }],
   },
 };
 const SLOT_GROUPS = [
   ["DRIVE", [["drive+", "FORWARD"], ["drive-", "REVERSE"], ["turn+", "TURN RIGHT"], ["turn-", "TURN LEFT"]]],
   ["LIFT / REACH", [["fork+", "FORK UP"], ["fork-", "FORK DOWN"], ["reach+", "REACH OUT"], ["reach-", "REACH IN"]]],
-  ["ACTIONS", [["stop", "STOP"], ["estop", "E-STOP"], ["home", "HOME Z"], ["creep", "CREEP (HOLD)"]]],
+  ["ACTIONS", [["stop", "STOP"], ["estop", "E-STOP"], ["home", "HOME Z"], ["creep", "CREEP (HOLD)"], ["pick", "CASE PLACED"]]],
 ];
-const BUTTON_SLOTS = ["stop", "estop", "home"];
+const BUTTON_SLOTS = ["stop", "estop", "home", "pick"];
 const AXIS_NAMES = ["LX", "LY", "RX", "RY"];
 const BTN_NAMES = { 0: "A", 1: "B", 2: "X", 3: "Y", 4: "LB", 5: "RB", 6: "LT", 7: "RT",
   8: "BACK", 9: "START", 10: "LS", 11: "RS", 12: "DPAD↑", 13: "DPAD↓", 14: "DPAD←", 15: "DPAD→" };
@@ -51,6 +52,7 @@ const state = {
   robots: [],
   robot: null,
   telem: null,
+  job: null,                              // active pick job (SSE)
   es: null,
   lastEvtId: 0,
   drive: { x: 0, y: 0, active: false },   // on-screen joystick, x=turn y=fwd
@@ -234,9 +236,19 @@ function openStream() {
   es.onmessage = (m) => {
     const d = JSON.parse(m.data);
     state.telem = d.telem;
+    state.job = d.job || null;
+    let taskEvt = false;
     for (const e of d.events || []) {
-      if (e.id > state.lastEvtId) { state.lastEvtId = e.id; appendEvent(e); }
+      if (e.id > state.lastEvtId) {
+        state.lastEvtId = e.id;
+        appendEvent(e);
+        if (e.kind === "task" || e.kind === "label") taskEvt = true;
+      }
     }
+    renderTaskPanel();
+    // keep the dashboard live: task/label events only appear when something
+    // actually changed, so refresh on those rather than every 100 ms tick
+    if (taskEvt && !$("tasks-modal").hidden) refreshJobs(false).catch(() => {});
     if (document.body.dataset.view === "console") {
       renderTelem(d);
       if (!d.connected && state.robot) { state.robot = null; showRobots(); }
@@ -309,6 +321,7 @@ const ACTION_FIRE = {
   stop: () => cmd({ t: "stop" }),
   estop: () => cmd({ t: "estop" }),
   home: () => cmd({ t: "home" }),
+  pick: () => casePlaced(),
 };
 $("btn-stop").addEventListener("click", ACTION_FIRE.stop);
 $("btn-estop").addEventListener("click", ACTION_FIRE.estop);
@@ -399,6 +412,8 @@ document.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   const slot = keyBound(k);
   if (!slot) return;
+  // a focused button already fires its own click on Enter — don't double-fire
+  if (slot === "pick" && tag === "BUTTON") return;
   e.preventDefault();
   if (BUTTON_SLOTS.includes(slot)) { if (!e.repeat) ACTION_FIRE[slot](); return; }
   state.keys.add(k);
@@ -565,7 +580,13 @@ document.addEventListener("keydown", (e) => {
 async function loadBindings() {
   try {
     const r = await api("/api/bindings");
-    if (r.bindings && r.bindings.slots) state.bindings = r.bindings;
+    if (r.bindings && r.bindings.slots) {
+      state.bindings = r.bindings;
+      // bindings saved by an older build may predate newer action slots
+      for (const s in DEFAULT_BINDINGS.slots) {
+        if (!state.bindings.slots[s]) state.bindings.slots[s] = structuredClone(DEFAULT_BINDINGS.slots[s]);
+      }
+    }
   } catch { /* defaults stand */ }
   renderKeysHint();
 }
@@ -973,6 +994,352 @@ function frame(ts) {
   drawScene({ pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed });
 }
 requestAnimationFrame(frame);
+
+/* ---------- pick tasks: sidebar panel + WMS dashboard ----------
+   Job state rides the SSE stream (payload.job = the active job + current
+   pick), so the sidebar panel is always live. The dashboard modal manages
+   the queue: import (JSON/CSV paste or file), start/close/delete jobs,
+   per-pick status + tag reprints, label previews, and the printer config. */
+
+function renderTaskPanel() {
+  const j = state.job;
+  $("task-empty").hidden = !!j;
+  $("task-active").hidden = !j;
+  if (!j) return;
+  $("task-name").textContent = (j.name || "").toUpperCase();
+  const handled = j.picked + j.quarantined;
+  $("task-fill").style.width = Math.round((100 * handled) / Math.max(1, j.total)) + "%";
+  $("task-counts").textContent =
+    `${j.picked}/${j.total} PICKED` +
+    (j.quarantined ? ` · ${j.quarantined} QUARANTINED` : "") +
+    (j.flagged ? " · ⚑ FLAGGED" : "");
+  $("task-counts").classList.toggle("flag", !!j.flagged);
+  const cur = j.current;
+  $("task-pick").hidden = !cur;
+  $("task-complete").hidden = !!cur;
+  if (cur) {
+    $("task-sku").textContent = cur.sku;
+    $("task-desc").textContent = cur.desc || "";
+    $("task-loc").textContent = cur.location || "—";
+    $("task-qty").textContent = cur.qty;
+    $("task-stop").textContent = cur.stop || "—";
+  } else {
+    const msg = $("task-complete-msg");
+    msg.textContent = j.flagged
+      ? "ALL CASES HANDLED — PALLET FLAGGED, CHECK LOG AT WRAP"
+      : "ALL CASES PLACED — WRAP & LABEL";
+    msg.classList.toggle("flagged", !!j.flagged);
+    $("btn-loader-label").textContent =
+      j.loader_label === "printed" ? "REPRINT LOADER" : "LOADER LABEL";
+  }
+}
+
+let _pickSent = { seq: 0, t: 0 };   // double-press guard (Enter / gamepad A)
+async function casePlaced() {
+  const j = state.job;
+  if (!j || !j.current) return;
+  const seq = j.current.seq;
+  if (_pickSent.seq === seq && Date.now() - _pickSent.t < 1500) return;
+  _pickSent = { seq, t: Date.now() };
+  await api("/api/picks/complete", { id: j.id, seq }).catch(() => {});
+}
+$("btn-case-placed").addEventListener("click", casePlaced);
+$("btn-quarantine").addEventListener("click", () => {
+  const j = state.job;
+  if (j && j.current) api("/api/picks/quarantine", { id: j.id, seq: j.current.seq }).catch(() => {});
+});
+$("btn-loader-label").addEventListener("click", () => {
+  if (state.job) api("/api/jobs/loader_label", { id: state.job.id }).catch(() => {});
+});
+$("btn-job-complete").addEventListener("click", () => {
+  if (state.job) api("/api/jobs/complete", { id: state.job.id }).catch(() => {});
+});
+
+/* ---- dashboard modal ---- */
+const tasksModal = $("tasks-modal");
+let dashJobs = [];
+let dashSel = null;
+
+async function openTasks() {
+  $("tasks-error").textContent = "";
+  $("label-preview").hidden = true;
+  await refreshPrinter().catch(() => {});
+  await refreshJobs(true).catch(() => {});
+  tasksModal.hidden = false;
+}
+$("btn-tasks").addEventListener("click", openTasks);
+$("btn-tasks-robots").addEventListener("click", openTasks);
+$("tasks-close").addEventListener("click", () => { tasksModal.hidden = true; });
+tasksModal.addEventListener("pointerdown", (e) => {
+  if (e.target === tasksModal) tasksModal.hidden = true;
+});
+
+async function refreshJobs(autoselect) {
+  const r = await api("/api/jobs");
+  dashJobs = r.jobs || [];
+  if (dashSel && !dashJobs.some((j) => j.id === dashSel)) dashSel = null;
+  if (autoselect && !dashSel && dashJobs.length) {
+    const act = dashJobs.find((j) => j.status === "active");
+    dashSel = (act || dashJobs[0]).id;
+  }
+  renderJobList();
+  await renderJobDetail();
+}
+
+const JOB_CHIP = { queued: "chip", active: "chip chip-ok", done: "chip chip-sim" };
+
+function renderJobList() {
+  const list = $("job-list");
+  list.innerHTML = "";
+  if (!dashJobs.length) {
+    const d = document.createElement("div");
+    d.className = "job-list-empty";
+    d.textContent = "No jobs yet — import an export below, or try the demo job.";
+    list.appendChild(d);
+    return;
+  }
+  for (const j of dashJobs) {
+    const item = document.createElement("div");
+    item.className = "job-item" + (j.id === dashSel ? " sel" : "");
+    const row = document.createElement("div");
+    row.className = "job-item-row";
+    const name = document.createElement("div");
+    name.className = "job-item-name";
+    name.textContent = j.name;
+    const chip = document.createElement("span");
+    chip.className = JOB_CHIP[j.status] || "chip";
+    chip.textContent = j.status.toUpperCase();
+    row.appendChild(name);
+    if (j.flagged) {
+      const flag = document.createElement("span");
+      flag.className = "chip chip-fault";
+      flag.textContent = "⚑";
+      row.appendChild(flag);
+    }
+    row.appendChild(chip);
+    const meta = document.createElement("div");
+    meta.className = "job-item-meta";
+    meta.textContent = `${j.picked}/${j.total} picked` +
+      (j.quarantined ? ` · ${j.quarantined} quar` : "") + ` · ${j.source}`;
+    item.appendChild(row);
+    item.appendChild(meta);
+    item.addEventListener("click", () => {
+      dashSel = j.id;
+      $("label-preview").hidden = true;
+      renderJobList();
+      renderJobDetail().catch(() => {});
+    });
+    list.appendChild(item);
+  }
+}
+
+function pickActBtn(text, title, fn) {
+  const b = document.createElement("button");
+  b.className = "pick-act";
+  b.textContent = text;
+  b.title = title;
+  b.addEventListener("click", fn);
+  return b;
+}
+
+async function renderJobDetail() {
+  const empty = $("job-detail-empty"), detail = $("job-detail");
+  if (!dashSel) { empty.hidden = false; detail.hidden = true; return; }
+  let job;
+  try { job = (await api("/api/jobs/detail?id=" + encodeURIComponent(dashSel))).job; }
+  catch { empty.hidden = false; detail.hidden = true; return; }
+  empty.hidden = true;
+  detail.hidden = false;
+
+  $("jd-name").textContent = job.name;
+  const meta = $("jd-meta");
+  meta.textContent = "";
+  const picked = job.picks.filter((p) => p.status === "picked").length;
+  const quar = job.picks.filter((p) => p.status === "quarantined").length;
+  const bits = [job.status.toUpperCase(), `${picked}/${job.picks.length} picked`];
+  if (quar) bits.push(`${quar} quarantined`);
+  bits.push(`loader label ${job.loader_label}`, job.source, job.created);
+  meta.append(bits.join(" · "));
+  if (job.flagged) {
+    const f = document.createElement("span");
+    f.className = "flag";
+    f.textContent = " · ⚑ CHECK PALLET";
+    meta.appendChild(f);
+  }
+
+  $("jd-activate").hidden = job.status !== "queued";
+  $("jd-complete").hidden = job.status !== "active";
+  $("jd-complete").disabled = job.picks.some((p) => p.status === "pending");
+  $("jd-loader").disabled = job.picks.every((p) => p.status === "pending");
+
+  const cur = job.status === "active"
+    ? (job.picks.find((p) => p.status === "pending") || {}).seq : null;
+  const rows = $("pick-rows");
+  rows.innerHTML = "";
+  for (const p of job.picks) {
+    const tr = document.createElement("tr");
+    if (p.seq === cur) tr.className = "cur";
+    const td = (cls, text) => {
+      const c = document.createElement("td");
+      if (cls) c.className = cls;
+      c.textContent = text;
+      tr.appendChild(c);
+      return c;
+    };
+    td("mono dim", p.seq);
+    td("mono", p.sku);
+    td("", p.desc);
+    td("mono", p.qty);
+    td("mono", p.location);
+    td("mono dim", p.stop || "");
+    const st = td("", "");
+    const stSpan = document.createElement("span");
+    stSpan.className = "pick-status " + p.status;
+    stSpan.textContent = p.status.toUpperCase();
+    stSpan.title = p.note || p.ts || "";
+    st.appendChild(stSpan);
+    const lb = td("", "");
+    const lbSpan = document.createElement("span");
+    lbSpan.className = "pick-label " + p.label;
+    lbSpan.textContent = p.label === "none" ? "—" : p.label.toUpperCase();
+    lb.appendChild(lbSpan);
+    const act = td("", "");
+    act.style.whiteSpace = "nowrap";
+    act.appendChild(pickActBtn("TAG", "preview the case tag",
+      () => showPreview(p.seq)));
+    if (p.status === "picked") {
+      act.appendChild(pickActBtn("RE-PRINT", "print this case tag again",
+        () => api("/api/labels/reprint", { id: job.id, seq: p.seq })
+          .then(() => renderJobDetail()).catch(() => {})));
+    }
+    if (p.status !== "pending") {
+      act.appendChild(pickActBtn("REOPEN", "put this case back in the queue",
+        () => api("/api/picks/reopen", { id: job.id, seq: p.seq })
+          .then(() => refreshJobs(false)).catch(() => {})));
+    } else if (job.status === "active") {
+      act.appendChild(pickActBtn("QUAR", "flag + skip this case",
+        () => api("/api/picks/quarantine", { id: job.id, seq: p.seq })
+          .then(() => refreshJobs(false)).catch(() => {})));
+    }
+    rows.appendChild(tr);
+  }
+}
+
+$("jd-activate").addEventListener("click", () =>
+  api("/api/jobs/activate", { id: dashSel }).then(() => refreshJobs(false))
+    .catch((e) => { $("tasks-error").textContent = e.message; }));
+$("jd-complete").addEventListener("click", () =>
+  api("/api/jobs/complete", { id: dashSel }).then(() => refreshJobs(false))
+    .catch((e) => { $("tasks-error").textContent = e.message; }));
+$("jd-delete").addEventListener("click", () =>
+  api("/api/jobs/delete", { id: dashSel }).then(() => { dashSel = null; return refreshJobs(false); })
+    .catch(() => {}));
+$("jd-loader").addEventListener("click", () =>
+  api("/api/jobs/loader_label", { id: dashSel })
+    .then((r) => { printerStatus(r.ok, r.detail); return refreshJobs(false); })
+    .catch((e) => { $("tasks-error").textContent = e.message; }));
+
+/* ---- import ---- */
+$("btn-import").addEventListener("click", async () => {
+  $("tasks-error").textContent = "";
+  try {
+    const r = await api("/api/jobs/import", { text: $("import-text").value });
+    $("import-text").value = "";
+    if (r.jobs && r.jobs.length) dashSel = r.jobs[0].id;
+    await refreshJobs(false);
+  } catch (e) { $("tasks-error").textContent = e.message; }
+});
+$("btn-demo").addEventListener("click", async () => {
+  $("tasks-error").textContent = "";
+  try {
+    const r = await api("/api/jobs/demo", {});
+    if (r.jobs && r.jobs.length) dashSel = r.jobs[0].id;
+    await refreshJobs(false);
+  } catch (e) { $("tasks-error").textContent = e.message; }
+});
+$("btn-import-file").addEventListener("click", () => $("import-file").click());
+$("import-file").addEventListener("change", () => {
+  const f = $("import-file").files[0];
+  if (!f) return;
+  f.text().then((t) => { $("import-text").value = t; });
+  $("import-file").value = "";
+});
+
+/* ---- label preview ---- */
+async function showPreview(seq) {
+  let r;
+  try { r = await api(`/api/labels/preview?id=${encodeURIComponent(dashSel)}&seq=${seq}`); }
+  catch (e) { $("tasks-error").textContent = e.message; return; }
+  const card = $("label-card");
+  card.innerHTML = "";
+  const el = (cls, text) => {
+    const d = document.createElement("div");
+    d.className = cls;
+    d.textContent = text;
+    card.appendChild(d);
+    return d;
+  };
+  const f = r.fields;
+  const band = el("lc-band", "");
+  const b1 = document.createElement("span"); b1.textContent = f.route_stop;
+  const b2 = document.createElement("span");
+  b2.textContent = f.pallet ? "PALLET " + f.pallet : "";
+  band.append(b1, b2);
+  if (seq === "loader") {
+    el("lc-sku", "LOADER");
+    el("lc-desc", `PALLET ${f.pallet || "—"}`);
+    el("lc-qty", `CASES ${f.picked}/${f.total}`);
+    el("lc-flag", f.flag_line);
+  } else {
+    el("lc-sku", f.sku);
+    el("lc-desc", f.desc);
+    el("lc-qty", `QTY ${f.qty} · CASE ${f.seq}/${f.total}`);
+  }
+  el("lc-barcode", "");
+  el("lc-code", String(f.barcode));
+  el("lc-ts", f.ts + (f.operator ? "   " + f.operator : ""));
+  $("label-zpl").textContent = r.zpl;
+  $("label-preview").hidden = false;
+}
+$("label-preview-close").addEventListener("click", () => { $("label-preview").hidden = true; });
+
+/* ---- printer config ---- */
+function printerChip(p) {
+  const chip = $("printer-chip");
+  chip.textContent = p.enabled ? `PRINTER ${p.host}:${p.port}` : "PRINTER OFF";
+  chip.className = p.enabled ? "chip chip-ok" : "chip";
+}
+function printerStatus(ok, text) {
+  const s = $("printer-status");
+  s.textContent = text;
+  s.className = "printer-hint " + (ok ? "ok" : "bad");
+}
+async function refreshPrinter() {
+  const p = (await api("/api/printer")).printer;
+  $("pr-host").value = p.host;
+  $("pr-port").value = p.port;
+  $("pr-enabled").checked = !!p.enabled;
+  printerChip(p);
+}
+$("printer-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const r = await api("/api/printer", {
+      host: $("pr-host").value, port: $("pr-port").value,
+      enabled: $("pr-enabled").checked,
+    });
+    printerChip(r.printer);
+    printerStatus(true, r.printer.enabled
+      ? `saved — labels go to ${r.printer.host}:${r.printer.port}`
+      : "saved — printing disabled (labels are skipped, picking continues)");
+  } catch (e2) { printerStatus(false, e2.message); }
+});
+$("pr-test").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/printer/test", {});
+    printerStatus(r.ok, r.detail);
+  } catch (e) { printerStatus(false, e.message); }
+});
 
 /* ---------- boot ---------- */
 // Liveness: hold a stream open so the desktop shell knows this window is up.
