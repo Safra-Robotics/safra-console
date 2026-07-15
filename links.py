@@ -69,6 +69,8 @@ class SimLink:
             r.trip_estop()
         elif t == "estop_reset":
             r.reset_estop()
+        elif t == "box":
+            r.cmd_move_box(cmd.get("id"), cmd.get("x", 0), cmd.get("y", 0))
 
     def snapshot(self):
         snap = self.robot.snapshot()

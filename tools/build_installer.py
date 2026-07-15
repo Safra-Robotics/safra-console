@@ -8,9 +8,10 @@ Three steps:
   2. Inno Setup (ISCC) packs that into a per-user installer,
      dist/SafraConsole-Setup.exe: installs per-user under LocalAppData
      (no admin), Start-Menu shortcut, uninstaller, and — on an update — the
-     Restart Manager closes and relaunches the running app. It also chains the
-     WebView2 Evergreen bootstrapper, run only when the runtime is missing, so
-     the app works out of the box without depending on the user's browser.
+     Restart Manager closes the running app while [Run] relaunches it (the same
+     path the app's one-click silent auto-update drives via /SILENT). It also
+     chains the WebView2 Evergreen bootstrapper, run only when the runtime is
+     missing, so the app works out of the box without depending on the browser.
   3. Writes dist/latest.json (the update feed: version, the installer's
      download URL, its sha256).
 
@@ -69,8 +70,12 @@ UninstallDisplayName=Safra Operator Console
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; On an in-place update the Restart Manager CLOSES the running app so its files
+; can be replaced; relaunch is handled explicitly by [Run] below (in both
+; interactive and silent installs), so RestartApplications stays off to keep the
+; silent auto-update relaunch deterministic — no RM restart racing the [Run].
 CloseApplications=yes
-RestartApplications=yes
+RestartApplications=no
 
 [Files]
 Source: "@SRCDIR@\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
@@ -86,7 +91,11 @@ Name: "{autodesktop}\Safra Operator Console"; Filename: "{app}\SafraConsole.exe"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Run]
+; interactive install: optional "Launch" checkbox on the finished page
 Filename: "{app}\SafraConsole.exe"; Description: "Launch Safra Operator Console"; Flags: nowait postinstall skipifsilent
+; silent auto-update: relaunch the app after an in-place update
+; (WizardSilent is true only under /SILENT or /VERYSILENT)
+Filename: "{app}\SafraConsole.exe"; Flags: nowait; Check: WizardSilent
 
 [Code]
 // Detect the WebView2 Evergreen runtime (per-machine or per-user). The runtime

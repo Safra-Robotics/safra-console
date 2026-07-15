@@ -97,7 +97,28 @@ async function initLogin() {
     }
   }
   setView("login");
+  refreshLoginGate();
 }
+
+// Pre-login update gate: an installed console won't let anyone sign in while an
+// update is pending — you must install it first (which relaunches into the new
+// version). Fails open: if the check hasn't finished or errored, sign-in stays
+// available. Mirrors the server-side block in /api/login.
+async function refreshLoginGate(retried) {
+  let s;
+  try { s = await api("/api/update/status"); } catch { return; }
+  if (!s.checked && !retried) { setTimeout(() => refreshLoginGate(true), 5000); return; }
+  if (s.available && s.available.url) {
+    updateUrl = s.available.url;
+    $("login-form").hidden = true;
+    $("setup-form").hidden = true;
+    $("login-update-text").textContent =
+      `Version ${s.available.version} must be installed before signing in. The console will restart to finish.`;
+    $("login-update-gate").hidden = false;
+  }
+}
+$("login-update-apply").addEventListener("click",
+  () => runSilentUpdate($("login-update-apply"), $("login-update-status")));
 
 $("setup-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -128,7 +149,10 @@ $("login-form").addEventListener("submit", async (e) => {
     loadBindings();
     refreshUpdateStatus();
     await showRobots();
-  } catch (err) { $("login-error").textContent = err.message; }
+  } catch (err) {
+    if (err.message === "update_required") { refreshLoginGate(true); return; }
+    $("login-error").textContent = err.message;
+  }
 });
 
 $("btn-logout").addEventListener("click", async () => {
@@ -603,7 +627,7 @@ function renderKeysHint() {
   $("hud-keys").textContent =
     `${firstKey("drive+")} ${firstKey("turn-")} ${firstKey("drive-")} ${firstKey("turn+")} drive · ` +
     `${firstKey("fork+")}/${firstKey("fork-")} fork · ${firstKey("reach+")}/${firstKey("reach-")} reach · ` +
-    `${firstKey("stop")} stop · ${firstKey("estop")} e-stop`;
+    `${firstKey("stop")} stop · ${firstKey("estop")} e-stop · V view · drag boxes`;
 }
 
 $("btn-controls").addEventListener("click", () => {
@@ -634,13 +658,32 @@ async function refreshUpdateStatus(retried) {
   if (s.available && s.available.url) {
     updateUrl = s.available.url;
     $("update-text").textContent = `Version ${s.available.version} is available.`;
-    $("update-apply").textContent = "Download update";
+    $("update-apply").textContent = "Install update";
     $("update-banner").hidden = false;
   }
 }
-$("update-apply").addEventListener("click", () => {
-  if (updateUrl) window.open(updateUrl, "_blank", "noopener");
-});
+// One-click silent update: the backend downloads + verifies the installer and
+// launches it with /SILENT; the installer then closes this app and relaunches
+// it in place. On any failure we fall back to opening the download so the
+// operator is never stranded. Shared by the post-login banner and the
+// pre-login update gate (refreshLoginGate).
+async function runSilentUpdate(btn, textEl) {
+  const prevBtn = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Updating…";
+  textEl.textContent = "Downloading and verifying the update…";
+  try {
+    await api("/api/update/apply", {});
+    textEl.textContent = "Update ready — the console will close briefly and restart to finish.";
+    btn.textContent = "Restarting…";
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = prevBtn;
+    textEl.textContent = `Couldn't auto-update (${err.message}). Opening the download…`;
+    if (updateUrl) window.open(updateUrl, "_blank", "noopener");
+  }
+}
+$("update-apply").addEventListener("click", () => runSilentUpdate($("update-apply"), $("update-text")));
 
 /* ---------- sim feed: first-person 3D from the mast camera ----------
    Dependency-free software renderer on canvas 2D. A pinhole camera rides the
@@ -676,14 +719,20 @@ const MAT = {
   pallet:  { col: [96, 71, 39], a: 0.97, edge: [201, 150, 70, 0.55] },
   bollard: { col: [232, 190, 22], a: 1.0, edge: [16, 16, 16, 0.7] },
   chassis: { col: [20, 20, 22], a: 0.98, edge: [255, 212, 0, 0.5] },
+  body:    { col: [188, 146, 28], a: 0.99, edge: [255, 212, 0, 0.75] },
+  mast:    { col: [72, 74, 80], a: 0.99, edge: [150, 156, 166, 0.5] },
+  tyre:    { col: [18, 18, 20], a: 1.0, edge: [70, 70, 74, 0.5] },
+  crate:   { col: [120, 96, 60], a: 0.97, edge: [230, 178, 58, 0.5] },
   strip:   { col: [255, 246, 214], a: 0.9, flat: true },
   lane:    { col: [230, 178, 58], a: 0.16, flat: true, edge: [230, 178, 58, 0.28] },
   dock:    { col: [200, 60, 40], a: 0.14, flat: true, edge: [230, 120, 60, 0.3] },
   pad:     { col: [70, 150, 120], a: 0.16, flat: true, edge: [90, 200, 160, 0.34] },
 };
 
-// eased view pose (10 Hz telem -> per-frame render); see feedSim() / frame()
-const view = { pose: [3, 4, 0], fork: 70, reach: 0, speed: 0, tel: null, have: false };
+// eased view pose (10 Hz telem -> per-frame render); see feedSim() / frame().
+// cam: "first" (mast cam) | "third" (chase cam). boxes: per-id eased positions.
+const view = { pose: [3, 4, 0], fork: 70, reach: 0, speed: 0, tel: null, have: false,
+               cam: "first", boxes: {}, camState: null };
 
 function resizeCanvas() {
   const box = canvas.parentElement.getBoundingClientRect();
@@ -771,14 +820,8 @@ const SCENE = (() => {
     }
   }
 
-  // staged pallets with box stacks out on the floor
-  const stack = (x, y, m) => {
-    add(boxFaces(x, y, 0, x + 1.2, y + 1.0, 0.14, MAT.pallet));            // pallet
-    add(boxFaces(x + 0.08, y + 0.08, 0.14, x + 1.12, y + 0.92, 0.62, m));  // lower case
-    add(boxFaces(x + 0.22, y + 0.18, 0.62, x + 0.86, y + 0.72, 1.04, MAT.card)); // upper case
-  };
-  stack(4.2, 1.5, MAT.card2);
-  stack(7.8, 2.3, MAT.pale);
+  // (floor pallets/crates are dynamic now — streamed in telemetry and drawn by
+  // boxFacesFromTelem so they can be pushed, carried on the forks, and dragged)
   return F;
 })();
 
@@ -805,11 +848,58 @@ function robotFaces(t) {
       f.push({ pts: face.pts.map((p) => W(p[0], p[1], p[2])), n: Rn(face.n), mat: face.mat });
     }
   };
-  mk(0.02, -0.26, 0.06, 0.34, 0.26, 0.34, MAT.chassis);                 // chassis apron under the camera
-  mk(0.30, -0.23, lift + 0.05, 0.37, 0.23, lift + 0.13, MAT.chassis);   // carriage cross-beam
-  mk(0.385, 0.123, lift - 0.025, 0.785, 0.203, lift, fork);             // left blade
-  mk(0.385, -0.203, lift - 0.025, 0.785, -0.123, lift, fork);           // right blade
+  // wheels
+  mk(0.16, 0.19, 0, 0.40, 0.31, 0.20, MAT.tyre);
+  mk(0.16, -0.31, 0, 0.40, -0.19, 0.20, MAT.tyre);
+  mk(-0.44, 0.17, 0, -0.20, 0.29, 0.22, MAT.tyre);
+  mk(-0.44, -0.29, 0, -0.20, -0.17, 0.22, MAT.tyre);
+  // body: hood over the drive + rear counterweight
+  mk(-0.50, -0.27, 0.10, 0.14, 0.27, 0.56, MAT.body);
+  mk(-0.54, -0.24, 0.05, -0.30, 0.24, 0.34, MAT.body);
+  // operator seat
+  mk(-0.24, -0.17, 0.56, 0.02, 0.17, 0.74, MAT.chassis);
+  mk(-0.26, -0.17, 0.74, -0.15, 0.17, 1.04, MAT.chassis);
+  // overhead guard (ROPS): four posts + a roof plate
+  for (const p of [[0.05, 0.22], [0.05, -0.26], [-0.46, 0.22], [-0.46, -0.26]])
+    mk(p[0], p[1], 0.56, p[0] + 0.045, p[1] + 0.045, 1.9, MAT.mast);
+  mk(-0.48, -0.28, 1.87, 0.13, 0.28, 1.93, MAT.mast);
+  // mast rails the forks ride
+  mk(0.30, 0.17, 0.10, 0.38, 0.25, 1.72, MAT.mast);
+  mk(0.30, -0.25, 0.10, 0.38, -0.17, 1.72, MAT.mast);
+  // fork carriage + blades (rise/fall with the load)
+  mk(0.33, -0.24, lift + 0.02, 0.40, 0.24, lift + 0.30, MAT.chassis);
+  mk(0.385, 0.10, lift - 0.03, 0.83, 0.20, lift, fork);
+  mk(0.385, -0.20, lift - 0.03, 0.83, -0.10, lift, fork);
   return f;
+}
+
+// dynamic boxes streamed from the sim (pushed / carried / dragged). Positions
+// ease toward the telemetry; a carried box is glued to the eased fork tip so it
+// tracks the forks smoothly instead of stepping at the 10 Hz telemetry rate.
+function boxFacesFromTelem(t) {
+  const faces = [], boxes = (t && t.boxes) || [];
+  const litEdge = [255, 240, 140, 0.95];
+  const mat = (base, carried) => (carried ? { col: base.col, a: base.a, edge: litEdge } : base);
+  const [rx, ry, rh] = view.pose;
+  const reach = view.reach / 1000, fz = view.fork / 1000;
+  const fcx = rx + Math.cos(rh) * (0.62 + reach), fcy = ry + Math.sin(rh) * (0.62 + reach);
+  for (const b of boxes) {
+    let e = view.boxes[b.id];
+    if (b.carried) {
+      e = view.boxes[b.id] = { x: fcx, y: fcy, z: fz };
+    } else {
+      if (!e) e = view.boxes[b.id] = { x: b.x, y: b.y, z: b.z };
+      e.x += (b.x - e.x) * 0.4; e.y += (b.y - e.y) * 0.4; e.z += (b.z - e.z) * 0.4;
+    }
+    const x0 = e.x - b.w / 2, y0 = e.y - b.d / 2, x1 = e.x + b.w / 2, y1 = e.y + b.d / 2;
+    if (b.kind === "pallet") {
+      faces.push(...boxFaces(x0, y0, e.z, x1, y1, e.z + 0.14, mat(MAT.pallet, b.carried)));
+      faces.push(...boxFaces(x0 + 0.05, y0 + 0.05, e.z + 0.14, x1 - 0.05, y1 - 0.05, e.z + b.h, mat(MAT.card, b.carried)));
+    } else {
+      faces.push(...boxFaces(x0, y0, e.z, x1, y1, e.z + b.h, mat(MAT.crate, b.carried)));
+    }
+  }
+  return faces;
 }
 
 // Lambert key light + distance fog -> a css fill for one face; `flat`
@@ -869,14 +959,24 @@ function drawScene(t) {
   const [rx, ry, rh] = t.pose;
   const cW = canvas.width, cH = canvas.height;
   const cx = cW / 2, cy = cH / 2;
-  const f = cH * 0.86;
-  const cosH = Math.cos(rh), sinH = Math.sin(rh);
-  const camX = rx + CAM.lx * cosH, camY = ry + CAM.lx * sinH;
-  const cosP = Math.cos(CAM.pitch), sinP = Math.sin(CAM.pitch);
+  const f = cH * (view.cam === "third" ? 0.95 : 0.86);
+  // camera pose by mode: first-person rides the mast top; third-person chases
+  // from above/behind and looks down at the truck.
+  let camX, camY, camZ, yaw, pitch;
+  if (view.cam === "third") {
+    yaw = rh; pitch = 0.46;
+    camX = rx - Math.cos(rh) * 3.4; camY = ry - Math.sin(rh) * 3.4; camZ = 2.35;
+  } else {
+    yaw = rh; pitch = CAM.pitch;
+    camX = rx + CAM.lx * Math.cos(rh); camY = ry + CAM.lx * Math.sin(rh); camZ = CAM.z;
+  }
+  const cosH = Math.cos(yaw), sinH = Math.sin(yaw);
+  const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+  view.camState = { camX, camY, camZ, cosH, sinH, cosP, sinP, f, cx, cy };  // for mouse unproject
 
   // world -> camera (d fwd, l left, u up) with the down-pitch applied
   const toCam = (p) => {
-    const dx = p[0] - camX, dy = p[1] - camY, dz = p[2] - CAM.z;
+    const dx = p[0] - camX, dy = p[1] - camY, dz = p[2] - camZ;
     const d = cosH * dx + sinH * dy;
     const l = -sinH * dx + cosH * dy;
     return [d * cosP - dz * sinP, l, d * sinP + dz * cosP];
@@ -885,7 +985,7 @@ function drawScene(t) {
 
   // ceiling / floor split at the horizon, each a soft vertical gradient
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const horizon = cy - f * Math.tan(CAM.pitch);
+  const horizon = cy - f * Math.tan(pitch);
   const ceil = ctx.createLinearGradient(0, 0, 0, Math.max(1, horizon));
   ceil.addColorStop(0, "#050507"); ceil.addColorStop(1, "#0e0e13");
   ctx.fillStyle = ceil; ctx.fillRect(0, 0, cW, Math.max(0, horizon));
@@ -910,8 +1010,9 @@ function drawScene(t) {
   }
 
   // faces: cull, clip, shade, painter-sort far -> near
-  const cam = [camX, camY, CAM.z], out = [];
+  const cam = [camX, camY, camZ], out = [];
   for (const face of SCENE) collectFace(face, toCam, proj, cam, out);
+  for (const face of boxFacesFromTelem(t)) collectFace(face, toCam, proj, cam, out);
   for (const face of robotFaces(t)) collectFace(face, toCam, proj, cam, out);
   out.sort((a, b) => b.depth - a.depth);
   ctx.lineJoin = "round";
@@ -923,12 +1024,13 @@ function drawScene(t) {
     if (o.stroke) { ctx.lineWidth = 1.1; ctx.strokeStyle = o.stroke; ctx.stroke(); }
   }
 
-  drawOverlay(cW, cH, cx, cy);
+  drawOverlay(cW, cH, cx, cy, view.cam === "first");
   _lastDrawTs = performance.now();
 }
 
-// camera-feed HUD: vignette, corner frame ticks, center reticle
-function drawOverlay(cW, cH, cx, cy) {
+// camera-feed HUD: vignette + corner frame ticks always; the aiming reticle
+// only in first-person (it's the mast camera's crosshair).
+function drawOverlay(cW, cH, cx, cy, reticle) {
   const vg = ctx.createRadialGradient(cx, cy, Math.min(cW, cH) * 0.26, cx, cy, Math.max(cW, cH) * 0.62);
   vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, "rgba(0,0,0,0.55)");
   ctx.fillStyle = vg; ctx.fillRect(0, 0, cW, cH);
@@ -940,6 +1042,7 @@ function drawOverlay(cW, cH, cx, cy) {
     ctx.moveTo(ox, oy + sy * len); ctx.lineTo(ox, oy); ctx.lineTo(ox + sx * len, oy);
     ctx.stroke();
   }
+  if (!reticle) return;
   const r0 = 4 * dp, r1 = 15 * dp;
   ctx.strokeStyle = "rgba(255,212,0,0.6)"; ctx.lineWidth = 1 * dp;
   ctx.beginPath();
@@ -966,7 +1069,7 @@ function feedSim(t) {
       document.body.dataset.view === "console" && state.robot && state.robot.kind === "sim") {
     view.pose = [t.pose[0], t.pose[1], t.pose[2]];
     view.fork = t.fork_mm; view.reach = t.y_mm; view.speed = t.speed || 0;
-    drawScene({ pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed });
+    drawScene(Object.assign({}, t, { pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed }));
   }
 }
 function angLerp(cur, tgt, k) {
@@ -991,7 +1094,7 @@ function frame(ts) {
   view.fork += (view.tel.fork_mm - view.fork) * k;
   view.reach += (view.tel.y_mm - view.reach) * k;
   view.speed += ((view.tel.speed || 0) - view.speed) * k;
-  drawScene({ pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed });
+  drawScene(Object.assign({}, view.tel, { pose: view.pose, fork_mm: view.fork, y_mm: view.reach, speed: view.speed }));
 }
 requestAnimationFrame(frame);
 
@@ -1340,6 +1443,65 @@ $("pr-test").addEventListener("click", async () => {
     printerStatus(r.ok, r.detail);
   } catch (e) { printerStatus(false, e.message); }
 });
+
+/* ---------- camera view toggle (1st / 3rd person) ---------- */
+function setCam(mode) {
+  view.cam = mode;
+  const btn = $("cam-toggle");
+  if (btn) btn.textContent = mode === "third" ? "VIEW · 3RD" : "VIEW · 1ST";
+}
+$("cam-toggle").addEventListener("click", () => setCam(view.cam === "third" ? "first" : "third"));
+document.addEventListener("keydown", (e) => {
+  if (document.body.dataset.view !== "console" || state.capture) return;
+  const tag = e.target.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  if (e.key.toLowerCase() === "v") { e.preventDefault(); setCam(view.cam === "third" ? "first" : "third"); }
+});
+
+/* ---------- mouse-drag boxes ---------- */
+// unproject a canvas pixel onto the world plane z=`z` using the camera basis
+// stashed by drawScene, then stream {t:"box"} intents to the sim.
+function screenToWorld(px, py, z) {
+  const s = view.camState;
+  if (!s) return null;
+  const a = (s.cx - px) / s.f, b = (s.cy - py) / s.f;    // camera-space ray, c0 = 1
+  const dx = s.cosP * s.cosH - a * s.sinH + b * s.sinP * s.cosH;
+  const dy = s.cosP * s.sinH + a * s.cosH + b * s.sinP * s.sinH;
+  const dz = -s.sinP + b * s.cosP;
+  if (Math.abs(dz) < 1e-6) return null;
+  const tt = (z - s.camZ) / dz;
+  if (tt <= 0) return null;                               // plane is behind the camera
+  return [s.camX + dx * tt, s.camY + dy * tt];
+}
+function canvasWorld(e, z) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width) return null;
+  return screenToWorld((e.clientX - rect.left) * (canvas.width / rect.width),
+                       (e.clientY - rect.top) * (canvas.height / rect.height), z);
+}
+let _drag = null, _dragT = 0;
+canvas.addEventListener("pointerdown", (e) => {
+  if (!(state.robot && state.robot.kind === "sim") || !view.tel || !view.tel.boxes) return;
+  const p = canvasWorld(e, 0.3);
+  if (!p) return;
+  const hit = view.tel.boxes.find((b) => !b.carried &&
+    Math.abs(p[0] - b.x) <= b.w / 2 + 0.05 && Math.abs(p[1] - b.y) <= b.d / 2 + 0.05);
+  if (!hit) return;
+  _drag = { id: hit.id, ox: hit.x - p[0], oy: hit.y - p[1] };
+  canvas.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!_drag) return;
+  const now = performance.now();
+  if (now - _dragT < 33) return;                          // throttle to ~30 Hz
+  _dragT = now;
+  const p = canvasWorld(e, 0.3);
+  if (p) cmd({ t: "box", id: _drag.id, x: p[0] + _drag.ox, y: p[1] + _drag.oy });
+});
+const endDrag = () => { _drag = null; };
+canvas.addEventListener("pointerup", endDrag);
+canvas.addEventListener("pointercancel", endDrag);
 
 /* ---------- boot ---------- */
 // Liveness: hold a stream open so the desktop shell knows this window is up.

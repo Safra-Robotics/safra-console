@@ -130,6 +130,21 @@ body[data-view="console"] #view-console { display: flex; }
 }
 .stack { display: flex; flex-direction: column; gap: 14px; }
 .setup-note { color: var(--muted); font-size: 12.5px; }
+.update-gate {
+  margin: 6px 0 2px; padding: 18px 18px 16px; text-align: center;
+  border: 1px solid rgba(255,212,0,.4); border-radius: 12px;
+  background: rgba(255,212,0,.05);
+}
+.update-gate-title {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .3em;
+  color: var(--yellow); margin-bottom: 10px;
+}
+.update-gate-text { font-size: 13px; color: var(--paper); line-height: 1.55; margin-bottom: 14px; }
+.update-gate .btn { width: 100%; }
+.update-gate-status {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+  color: var(--muted); margin-top: 10px; min-height: 14px;
+}
 .login-foot {
   margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--line);
   color: #6a675f; font-size: 11px; line-height: 1.5;
@@ -191,6 +206,11 @@ body[data-view="console"] #view-console { display: flex; }
 .hud-feed { top: 12px; left: 12px; color: var(--yellow); border-color: rgba(255,212,0,.4); }
 .hud-pose { bottom: 12px; left: 12px; }
 .hud-keys { top: 12px; right: 12px; color: var(--muted); letter-spacing: .08em; }
+.hud-cam {
+  bottom: 12px; right: 12px; cursor: pointer; color: var(--yellow);
+  border-color: rgba(255,212,0,.4); appearance: none; -webkit-appearance: none;
+}
+.hud-cam:hover { background: rgba(255,212,0,.14); }
 
 .fault-overlay {
   position: absolute; inset: 0; display: flex; flex-direction: column;

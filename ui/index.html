@@ -49,6 +49,13 @@
       <button class="btn btn-cta" type="submit">Enroll operator</button>
     </form>
 
+    <div id="login-update-gate" class="update-gate" hidden>
+      <div class="update-gate-title">UPDATE REQUIRED</div>
+      <div class="update-gate-text" id="login-update-text"></div>
+      <button class="btn btn-cta" id="login-update-apply">Install update</button>
+      <div class="update-gate-status" id="login-update-status"></div>
+    </div>
+
     <div class="login-foot">Operator identity feeds the session log. Local console on 127.0.0.1 — not a network security boundary.
       <div class="login-version">SAFRA OPERATOR CONSOLE <span id="app-version"></span></div>
     </div>
@@ -127,6 +134,7 @@
       <div class="hud hud-feed" id="hud-feed">SIM FEED</div>
       <div class="hud hud-pose" id="hud-pose"></div>
       <div class="hud hud-keys" id="hud-keys"></div>
+      <button class="hud hud-cam" id="cam-toggle">VIEW · 1ST</button>
       <div class="fault-overlay" id="fault-overlay" hidden>
         <div class="fault-overlay-title" id="fault-overlay-title">FAULT</div>
         <div class="fault-overlay-sub" id="fault-overlay-sub"></div>

@@ -36,6 +36,54 @@ TRACK_M = 0.4932          # wheel track (2 x 246.6 mm half-track)
 V_MAX = 1.0               # m/s at 100% throttle
 WORLD_W, WORLD_H = 12.0, 8.0   # sim floor, m
 
+# --- world: static obstacles (collision + render) & dynamic boxes -------------
+ROBOT_R = 0.42            # robot footprint radius, m (drive collision)
+WALL_TH = 0.08           # perimeter wall thickness, m
+FORK_CARRY_X = 0.62      # forward offset (m) of the fork carry point, + reach
+PICK_UNDER = 0.14        # forks slide under a box within this height of its base
+
+# x0, y0, x1, y1, height, kind  (collision uses the footprint; render uses all)
+OBSTACLES = [
+    (0.0, 0.0, WORLD_W, WALL_TH, 2.6, "wall"),                  # south
+    (0.0, WORLD_H - WALL_TH, WORLD_W, WORLD_H, 2.6, "wall"),    # north
+    (0.0, 0.0, WALL_TH, WORLD_H, 2.6, "wall"),                  # west
+    (WORLD_W - WALL_TH, 0.0, WORLD_W, WORLD_H, 2.6, "wall"),    # east
+    (0.8, WORLD_H - WALL_TH - 0.9, 5.2, WORLD_H - WALL_TH, 2.0, "rack"),   # N rack bay 1
+    (6.6, WORLD_H - WALL_TH - 0.9, 11.1, WORLD_H - WALL_TH, 2.0, "rack"),  # N rack bay 2
+]
+
+# dynamic boxes on the floor (x,y = centre; w,d = footprint; h = height)
+INIT_BOXES = [
+    {"id": "palletA", "x": 4.7, "y": 2.1, "w": 1.15, "d": 0.95, "h": 0.66, "kind": "pallet"},
+    {"id": "crateB",  "x": 8.3, "y": 2.7, "w": 0.90, "d": 0.90, "h": 0.60, "kind": "crate"},
+    {"id": "crateC",  "x": 2.5, "y": 5.2, "w": 0.85, "d": 0.85, "h": 0.80, "kind": "crate"},
+    {"id": "palletD", "x": 9.7, "y": 5.0, "w": 1.05, "d": 1.00, "h": 0.70, "kind": "pallet"},
+]
+
+
+def _closest_on_aabb(cx, cy, a):
+    return min(max(cx, a[0]), a[2]), min(max(cy, a[1]), a[3])
+
+
+def _aabb_of(b):
+    return (b["x"] - b["w"] / 2, b["y"] - b["d"] / 2,
+            b["x"] + b["w"] / 2, b["y"] + b["d"] / 2)
+
+
+def _separate(a, o, bx, by):
+    """Min-translation separation of AABB `a` (centred at bx,by) out of AABB `o`.
+    Returns the adjusted centre (bx,by)."""
+    ox = min(a[2], o[2]) - max(a[0], o[0])
+    oy = min(a[3], o[3]) - max(a[1], o[1])
+    if ox <= 0 or oy <= 0:
+        return bx, by
+    acx, acy = (a[0] + a[2]) / 2, (a[1] + a[3]) / 2
+    ocx, ocy = (o[0] + o[2]) / 2, (o[1] + o[3]) / 2
+    if ox < oy:
+        return bx + (ox if acx >= ocx else -ox), by
+    return bx, by + (oy if acy >= ocy else -oy)
+
+
 BOOT, HOMING, READY, MOVING, FAULT = range(5)
 F_NONE, F_ESTOP, F_WATCHDOG, F_LIMIT, F_SERIAL, F_BADCMD = range(6)
 
@@ -70,6 +118,9 @@ class SimRobot:
         self._rev_hold = [0.0, 0.0]   # reverse-interlock brake timers
         self.pose = [3.0, 4.0, 0.0]   # x m, y m, heading rad
         self.speed = 0.0
+        self.boxes = [dict(b, z=0.0, carried=False) for b in INIT_BOXES]
+        self._carried = None          # id of the box riding the forks, or None
+        self._engaged = None          # id of the box the forks are currently under
         self.soc = 100.0
         self._events = []
         self._run = True
@@ -193,6 +244,160 @@ class SimRobot:
             npos, v = hi, 0.0
         return npos, v, None
 
+    # --- world / boxes / collision --------------------------------------------
+
+    def cmd_move_box(self, box_id, x, y):
+        """Reposition a box (mouse-drag from the console). Ignored while the box
+        rides the forks. The box is settled out of walls/racks/other boxes."""
+        with self._lock:
+            b = self._box(box_id)
+            if b is None or b["carried"]:
+                return False
+            b["x"], b["y"], b["z"] = float(x), float(y), 0.0
+            self._settle_box(b)
+            return True
+
+    def _box(self, bid):
+        for b in self.boxes:
+            if b["id"] == bid:
+                return b
+        return None
+
+    def _resolve_static(self, x, y):
+        """Push the robot circle out of any wall/rack AABB (slides along faces)."""
+        for _ in range(2):
+            for o in OBSTACLES:
+                qx, qy = _closest_on_aabb(x, y, o)
+                dx, dy = x - qx, y - qy
+                d2 = dx * dx + dy * dy
+                if d2 < ROBOT_R * ROBOT_R:
+                    d = math.sqrt(d2)
+                    if d > 1e-6:
+                        x += dx / d * (ROBOT_R - d)
+                        y += dy / d * (ROBOT_R - d)
+                    else:                       # centre inside: eject upward
+                        y = o[3] + ROBOT_R
+        return x, y
+
+    def _collide_boxes(self, x, y, h):
+        """Robot vs dynamic boxes: shove a box aside, or (if it's jammed) stop
+        the robot. Boxes the forks are sliding under are skipped so you can
+        drive under a pallet to pick it up."""
+        for b in self.boxes:
+            # skip the box on the forks, or the one the forks are engaged under
+            # (raising the forks should lift it, not shove it)
+            if b["carried"] or b["id"] == self._engaged:
+                continue
+            a = _aabb_of(b)
+            qx, qy = _closest_on_aabb(x, y, a)
+            dx, dy = x - qx, y - qy
+            if dx * dx + dy * dy >= ROBOT_R * ROBOT_R:
+                continue
+            if self._can_slide_under(b, x, y, h):
+                continue
+            d = math.sqrt(dx * dx + dy * dy)
+            if d > 1e-6:
+                nx, ny, pen = dx / d, dy / d, ROBOT_R - d
+            else:                               # centre inside: shove it forward
+                nx, ny, pen = -math.cos(h), -math.sin(h), ROBOT_R
+            b["x"] -= nx * pen                  # push the box away from the robot
+            b["y"] -= ny * pen
+            self._settle_box(b)
+            a = _aabb_of(b)                     # if it couldn't move, stop the robot
+            qx, qy = _closest_on_aabb(x, y, a)
+            dx, dy = x - qx, y - qy
+            d2 = dx * dx + dy * dy
+            if d2 < ROBOT_R * ROBOT_R:
+                d = math.sqrt(d2)
+                if d > 1e-6:
+                    x += dx / d * (ROBOT_R - d)
+                    y += dy / d * (ROBOT_R - d)
+                else:
+                    x -= nx * ROBOT_R
+                    y -= ny * ROBOT_R
+        return x, y
+
+    def _can_slide_under(self, b, x, y, h):
+        fz = self.fork_mm / 1000.0
+        if fz > b["z"] + PICK_UNDER:            # forks above the base -> no
+            return False
+        reach = self.y / 1000.0
+        cx = x + math.cos(h) * (FORK_CARRY_X + reach)
+        cy = y + math.sin(h) * (FORK_CARRY_X + reach)
+        a = _aabb_of(b)
+        return (a[0] - 0.25 <= cx <= a[2] + 0.25) and (a[1] - 0.25 <= cy <= a[3] + 0.25)
+
+    def _settle_box(self, b):
+        """Keep a box inside the arena and out of walls/racks/other boxes."""
+        b["x"] = max(b["w"] / 2, min(WORLD_W - b["w"] / 2, b["x"]))
+        b["y"] = max(b["d"] / 2, min(WORLD_H - b["d"] / 2, b["y"]))
+        for _ in range(3):
+            a = _aabb_of(b)
+            for o in OBSTACLES:
+                b["x"], b["y"] = _separate(a, o, b["x"], b["y"])
+                a = _aabb_of(b)
+            for other in self.boxes:
+                if other is b or other["carried"]:
+                    continue
+                b["x"], b["y"] = _separate(a, _aabb_of(other), b["x"], b["y"])
+                a = _aabb_of(b)
+
+    def _support_z(self, b):
+        """Resting height for a box at its (x,y): floor, or the top of a box
+        under it (so loads can be stacked)."""
+        rest, a = 0.0, _aabb_of(b)
+        for other in self.boxes:
+            if other is b or other["carried"]:
+                continue
+            oa = _aabb_of(other)
+            if a[0] < oa[2] and a[2] > oa[0] and a[1] < oa[3] and a[3] > oa[1]:
+                rest = max(rest, other["z"] + other["h"])
+        return rest
+
+    def _update_fork_carry(self, x, y, h):
+        """Forklift logic: forks low + under a box latches 'engaged'; raising
+        them lifts it; lowering onto a surface sets it down."""
+        fz = self.fork_mm / 1000.0
+        reach = self.y / 1000.0
+        cx = x + math.cos(h) * (FORK_CARRY_X + reach)
+        cy = y + math.sin(h) * (FORK_CARRY_X + reach)
+        if self._carried is not None:
+            b = self._box(self._carried)
+            if b is None:
+                self._carried = None
+                return
+            b["x"], b["y"], b["z"] = cx, cy, fz
+            rest = self._support_z(b)
+            # release when the forks are lowered near the resting surface; the
+            # margin sits above the 70 mm fork floor and below the lift point so
+            # setting down doesn't immediately re-grab.
+            if fz <= rest + 0.12:
+                b["z"], b["carried"] = rest, False
+                self._carried = self._engaged = None
+            return
+        under = None
+        for b in self.boxes:
+            if b["carried"]:
+                continue
+            a = _aabb_of(b)
+            if a[0] <= cx <= a[2] and a[1] <= cy <= a[3] and fz <= b["z"] + PICK_UNDER:
+                under = b
+                break
+        if under is not None:
+            self._engaged = under["id"]
+        if self._engaged is not None:
+            b = self._box(self._engaged)
+            if b is None or b["carried"]:
+                self._engaged = None
+                return
+            a = _aabb_of(b)
+            inside = a[0] <= cx <= a[2] and a[1] <= cy <= a[3]
+            if inside and fz > b["z"] + PICK_UNDER + 0.02:   # raised -> lift it
+                b["carried"] = True
+                self._carried = b["id"]
+            elif not inside:
+                self._engaged = None
+
     def _loop(self):
         last = time.monotonic()
         while self._run:
@@ -265,13 +470,19 @@ class SimRobot:
         v = (vl + vr) / 2.0
         w = (vr - vl) / TRACK_M
         x, y, h = self.pose
-        h += w * dt
+        h = math.atan2(math.sin(h + w * dt), math.cos(h + w * dt))
         x += v * math.cos(h) * dt
         y += v * math.sin(h) * dt
-        x = max(0.5, min(WORLD_W - 0.5, x))
-        y = max(0.5, min(WORLD_H - 0.5, y))
-        self.pose = [x, y, math.atan2(math.sin(h), math.cos(h))]
+        # collide with walls, racks and boxes (boxes get shoved unless the forks
+        # are sliding under them); then keep the carried box on the forks
+        x, y = self._resolve_static(x, y)
+        x, y = self._collide_boxes(x, y, h)
+        x, y = self._resolve_static(x, y)
+        x = max(ROBOT_R, min(WORLD_W - ROBOT_R, x))
+        y = max(ROBOT_R, min(WORLD_H - ROBOT_R, y))
+        self.pose = [x, y, h]
         self.speed = abs(v)
+        self._update_fork_carry(x, y, h)
 
         moving = (abs(self._wheel[0]) > 0.5 or abs(self._wheel[1]) > 0.5
                   or abs(self.z_vel) > 0.05 or abs(self.y_vel) > 0.05)
@@ -319,6 +530,14 @@ class SimRobot:
                 "speed": round(self.speed, 3),
                 "soc": round(self.soc, 1),
                 "volts": round(volts, 1),
+                "carried": self._carried,
+                "boxes": [{"id": b["id"], "x": round(b["x"], 3), "y": round(b["y"], 3),
+                           "z": round(b["z"], 3), "w": b["w"], "d": b["d"], "h": b["h"],
+                           "kind": b["kind"], "carried": b["carried"]} for b in self.boxes],
+                "world": {"w": WORLD_W, "h": WORLD_H, "wall_th": WALL_TH,
+                          "robot_r": ROBOT_R,
+                          "obstacles": [{"x0": o[0], "y0": o[1], "x1": o[2], "y1": o[3],
+                                         "h": o[4], "kind": o[5]} for o in OBSTACLES]},
             }
 
     def close(self):

@@ -3,9 +3,12 @@
 The distributable is a Windows installer (SafraConsole-Setup.exe, built by
 tools/build_installer.py and published as a GitHub release asset). At
 startup the app fetches the release feed (latest.json); if a newer version
-is published, the UI shows a "Download update" button that opens the new
-installer. Running it updates in place — the Inno Setup installer closes the
-running app and restarts it via the Windows Restart Manager.
+is published, the UI shows an "Install update" button. That calls
+apply_update(), which downloads the installer, verifies its sha256 against
+the manifest, and launches it silently (/SILENT); the Inno Setup installer
+closes the running app via the Restart Manager, updates in place, and
+relaunches it. If the silent apply fails the UI falls back to opening the
+installer URL for a manual download.
 
 A source checkout never reports updates — git is its channel.
 
@@ -15,10 +18,13 @@ always resolves to the newest published release; override in
 data/update.json.
 """
 
+import hashlib
 import json
 import os
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import urllib.request
 
@@ -87,3 +93,52 @@ def check(timeout=6):
 
 def check_async():
     threading.Thread(target=check, daemon=True).start()
+
+
+def download_installer(timeout=180):
+    """Download the pending update's installer to a temp file, verifying its
+    sha256 against the manifest. Returns the local path; raises on any problem
+    (no update, network error, checksum mismatch) so the caller can fall back
+    to a manual download."""
+    with _lock:
+        avail = _status.get("available")
+    if not avail or not avail.get("url"):
+        raise RuntimeError("no update is available")
+    want = (avail.get("sha256") or "").lower()
+    dest = os.path.join(tempfile.mkdtemp(prefix="SafraConsoleUpdate-"),
+                        "SafraConsole-Setup.exe")
+    sha = hashlib.sha256()
+    with _fetch(avail["url"], timeout) as r, open(dest, "wb") as f:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            f.write(chunk)
+            sha.update(chunk)
+    if want and sha.hexdigest() != want:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise RuntimeError("update checksum mismatch — download rejected")
+    return dest
+
+
+def apply_update():
+    """Download the update and launch its installer silently.
+
+    The Inno Setup installer closes this running app via the Restart Manager,
+    updates in place, and relaunches it (see tools/build_installer.py), so this
+    returns just before the app is shut down. Packaged build only — a source
+    checkout updates via git.
+    """
+    if not is_installed():
+        raise RuntimeError("auto-update applies to the installed build only "
+                           "(a source checkout updates via git)")
+    installer = download_installer()
+    # /SILENT shows a small progress bar (no wizard); /SUPPRESSMSGBOXES and
+    # /NOCANCEL keep it hands-off. Detach it so it outlives this process when
+    # the installer's Restart Manager step closes the app mid-update.
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([installer, "/SILENT", "/SUPPRESSMSGBOXES", "/NOCANCEL"],
+                     creationflags=flags, close_fds=True)
+    return {"ok": True}

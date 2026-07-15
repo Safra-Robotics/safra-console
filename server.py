@@ -235,8 +235,9 @@ class Handler(BaseHTTPRequestHandler):
             if self._auth():
                 self._json({"bindings": stores.load_bindings()})
         elif u.path == "/api/update/status":
-            if self._auth():
-                self._json(updater.status())
+            # public: the pre-login update gate reads this before any session
+            # exists (see /api/login and the UI's refreshLoginGate)
+            self._json(updater.status())
         elif u.path == "/api/jobs":
             if self._auth():
                 self._json({"jobs": wms.list_jobs()})
@@ -297,6 +298,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "operator": op})
 
         elif u.path == "/api/login":
+            # gate sign-in behind a pending update: an installed console must be
+            # updated first (applying it relaunches into the new version). Only
+            # blocks once the check has actually found a newer release, so a
+            # source checkout / offline / not-yet-checked state stays open.
+            avail = updater.status().get("available")
+            if avail:
+                self._json({"error": "update_required", "update": avail}, 409)
+                return
             op = stores.check_pin(b.get("name", ""), b.get("pin", ""))
             if not op:
                 time.sleep(0.5)  # blunt brute-force damper
@@ -356,6 +365,17 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/update/check":
             if self._auth():
                 self._json(updater.check())
+
+        elif u.path == "/api/update/apply":
+            # download + verify + launch the installer silently; the installer
+            # then closes this app and relaunches it once it's in place. Public
+            # (no _auth): it's also the pre-login update gate's action, so it
+            # can't require a session. 127.0.0.1-only, and it runs only the
+            # sha256-verified installer from the configured feed.
+            try:
+                self._json(updater.apply_update())
+            except Exception as e:
+                self._json({"error": str(e)}, 502)
 
         # --- pick jobs / labels ------------------------------------------------
 
